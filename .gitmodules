@@ -1,0 +1,3 @@
+[submodule "newton"]
+	path = newton
+	url = https://github.com/newton-physics/newton
