@@ -101,8 +101,14 @@ def scale_viewer_ui(viewer, font_scale):
 class Example:
     def __init__(self, viewer, args):
         self.fps = 60
-        self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 10
+        self.frame_dt = (
+            getattr(args, "frame_dt", 1.0 / self.fps)
+            if args is not None
+            else 1.0 / self.fps
+        )
+        self.sim_substeps = (
+            getattr(args, "sim_substeps", 10) if args is not None else 10
+        )
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
         self.teleop_linear_speed = 0.25
@@ -118,6 +124,37 @@ class Example:
         self.cloth_iterations = 10
         self.cloth_asset = getattr(args, "cloth_asset", "grid") if args is not None else "grid"
         self.grasp_mode = getattr(args, "grasp_mode", "constraint") if args is not None else "constraint"
+        self.world_count = getattr(args, "batch_size", 1) if args is not None else 1
+        self.env_spacing = getattr(args, "env_spacing", 2.0) if args is not None else 2.0
+        self.skip_ik_setup = getattr(args, "skip_ik_setup", False) if args is not None else False
+        self.use_joint_position_targets = (
+            getattr(args, "use_joint_position_targets", False)
+            if args is not None
+            else False
+        )
+        self.joint_target_ke = (
+            getattr(args, "joint_target_ke", 8500.0)
+            if args is not None
+            else 8500.0
+        )
+        self.joint_target_kd = (
+            getattr(args, "joint_target_kd", 450.0)
+            if args is not None
+            else 450.0
+        )
+        self.max_triangle_pairs = (
+            getattr(args, "max_triangle_pairs", 1000000)
+            if args is not None
+            else 1000000
+        )
+        self.collision_broad_phase = (
+            getattr(args, "collision_broad_phase", "nxn")
+            if args is not None
+            else "nxn"
+        )
+        self.cloth_iterations = (
+            getattr(args, "cloth_iterations", 10) if args is not None else 10
+        )
         self.table_workspace_margin = 0.04
         self.gripper_table_clearance = 0.00
         self.max_grasp_particles = 48
@@ -143,8 +180,12 @@ class Example:
         self.table_top_z = float(table_top_z)
         robot_builder = newton.ModelBuilder()
         robot_builder.default_joint_cfg.armature = 0.01
-        robot_builder.default_joint_cfg.target_ke = 0.0
-        robot_builder.default_joint_cfg.target_kd = 0.0
+        if self.use_joint_position_targets:
+            robot_builder.default_joint_cfg.target_ke = self.joint_target_ke
+            robot_builder.default_joint_cfg.target_kd = self.joint_target_kd
+        else:
+            robot_builder.default_joint_cfg.target_ke = 0.0
+            robot_builder.default_joint_cfg.target_kd = 0.0
         robot_builder.default_shape_cfg.ke = self.shape_contact_ke
         robot_builder.default_shape_cfg.kd = self.shape_contact_kd
         robot_builder.default_shape_cfg.mu = self.shape_contact_mu
@@ -189,6 +230,14 @@ class Example:
             self.cloth_self_contact_margin = 0.00045
             self._add_twist_cloth(scene, table_pos, table_top_z)
         scene.color(include_bending=True)
+        if self.world_count > 1:
+            single_world = scene
+            scene = newton.ModelBuilder(gravity=-981.0)
+            scene.replicate(
+                single_world,
+                self.world_count,
+                spacing=(self.env_spacing, 0.0, 0.0),
+            )
 
         self.model = scene.finalize()
         self.model.soft_contact_ke = self.cloth_soft_contact_ke
@@ -215,7 +264,8 @@ class Example:
         )
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
-            broad_phase="nxn",
+            broad_phase=self.collision_broad_phase,
+            max_triangle_pairs=self.max_triangle_pairs,
             soft_contact_margin=self.cloth_body_contact_margin,
         )
 
@@ -238,7 +288,10 @@ class Example:
         }
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
-        self._setup_arm_ik()
+        if self.skip_ik_setup:
+            self.arm_ik = {}
+        else:
+            self._setup_arm_ik()
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(
@@ -631,7 +684,8 @@ class Example:
             self.model.particle_count = 0
             self.model.gravity.assign(self.gravity_zero)
             self.model.shape_contact_pair_count = 0
-            self.state_0.joint_qd.assign(self.target_joint_qd)
+            if not self.use_joint_position_targets:
+                self.state_0.joint_qd.assign(self.target_joint_qd)
             self.robot_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
             self._drive_grasped_particles(self.state_1.body_q)
             self.state_0.particle_f.zero_()
