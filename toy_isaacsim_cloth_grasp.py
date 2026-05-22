@@ -27,8 +27,6 @@ import torch
 
 from isaacsim_newton_scene import (
     ADHESIVE_CONTACT_MARGIN,
-    ADHESIVE_PATCH_MAX_PARTICLES,
-    _expand_adhesive_patch_indices,
     CLOTH_ADHESION_OFFSET_SCALE,
     CLOTH_CONTACT_OFFSET,
     CLOTH_PARTICLE_ADHESION,
@@ -72,8 +70,8 @@ FINGER_VISUAL_SIZE = FINGER_SIZE
 TOY_CLOTH_CENTER = (-0.15, TABLE_CENTER[1], TABLE_CENTER[2] + 0.075)
 FINGER_CENTER_X = TOY_CLOTH_CENTER[0]
 FINGER_START_Y_OFFSET = 0.070
-# Keep the closed jaw wide enough for folded cloth layers to remain physical.
-FINGER_CLOSED_Y_OFFSET = 0.021
+# Keep a physical gap for folded cloth while preserving finger normal force.
+FINGER_CLOSED_Y_OFFSET = 0.019
 FINGER_START_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.230
 FINGER_PRESS_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.046
 FINGER_CLOSE_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.070
@@ -82,7 +80,9 @@ FINGER_INNER_ATTACH_NORMAL_OFFSET = 0.006
 ADHESIVE_PRESS_GAP = 0.090
 TOY_CLOTH_REST_OFFSET = 0.005
 TOY_CLOTH_CONTACT_OFFSET = 0.005
-TOY_CLOTH_PARTICLE_MASS = 0.005
+TOY_CLOTH_TOTAL_MASS = 0.050
+TOY_CLOTH_PARTICLE_COUNT = (49 + 1) * (33 + 1)
+TOY_CLOTH_PARTICLE_MASS = TOY_CLOTH_TOTAL_MASS / TOY_CLOTH_PARTICLE_COUNT
 TOY_CLOTH_STRETCH_STIFFNESS = 12000.0
 TOY_CLOTH_BEND_STIFFNESS = 80.0
 TOY_CLOTH_SHEAR_STIFFNESS = 6000.0
@@ -113,12 +113,18 @@ def _parse_args():
         help="Render every scripted physics step to the viewport for VNC playback.",
     )
     parser.add_argument(
+        "--viewport-camera",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Set the active viewport to the toy scene camera.",
+    )
+    parser.add_argument(
         "--live-step-seconds",
         type=float,
         default=0.05,
         help="Sleep after live-rendered steps so the scripted motion is watchable.",
     )
-    parser.add_argument("--steps", type=int, default=620)
+    parser.add_argument("--steps", type=int, default=476)
     parser.add_argument(
         "--start-closed",
         action=argparse.BooleanOptionalAction,
@@ -135,12 +141,24 @@ def _parse_args():
     )
     parser.add_argument("--close-steps", type=int, default=110)
     parser.add_argument(
+        "--finger-closed-y-offset",
+        type=float,
+        default=FINGER_CLOSED_Y_OFFSET,
+        help="Closed finger centerline Y offset from the cloth center.",
+    )
+    parser.add_argument(
         "--pinch-settle-steps",
         type=int,
-        default=80,
+        default=0,
         help="Hold closed fingers still before lifting so the fold can settle.",
     )
     parser.add_argument("--lift-steps", type=int, default=300)
+    parser.add_argument(
+        "--finger-lift-z",
+        type=float,
+        default=FINGER_LIFT_Z,
+        help="Absolute world z target for the scripted lift.",
+    )
     parser.add_argument("--release-steps", type=int, default=60)
     parser.add_argument(
         "--explicit-sticking",
@@ -152,7 +170,7 @@ def _parse_args():
         "--expand-adhesive-patch",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Expand contact seeds to a large patch. Disable for local-grasp visualization.",
+        help="Expand contact seeds to a larger driven patch.",
     )
     parser.add_argument(
         "--adhesive-pair-mode",
@@ -163,14 +181,83 @@ def _parse_args():
     parser.add_argument(
         "--adhesive-patch-max-particles",
         type=int,
-        default=32,
+        default=64,
         help="Maximum compressed contact particles to attach before optional expansion.",
     )
     parser.add_argument(
         "--adhesive-local-patch-radius",
         type=float,
-        default=0.018,
-        help="Keep adhesive seeds within this tangent-plane radius of the strongest contact.",
+        default=0.0,
+        help=(
+            "Optional tangent-plane radius around the strongest contact. "
+            "Use 0 to keep the physical contact candidate patch."
+        ),
+    )
+    parser.add_argument(
+        "--adhesive-expanded-patch-radius",
+        type=float,
+        default=0.045,
+        help="Tangent-plane radius for optional patch expansion.",
+    )
+    parser.add_argument(
+        "--adhesive-expanded-patch-max-particles",
+        type=int,
+        default=160,
+        help="Maximum particles retained after optional patch expansion.",
+    )
+    parser.add_argument(
+        "--pregrasp-patch-count",
+        choices=("one", "two"),
+        default="two",
+        help="Attach one full-scene-style pregrasp patch or one patch per finger bottom.",
+    )
+    parser.add_argument(
+        "--attached-velocity-mode",
+        choices=("target", "zero"),
+        default="target",
+        help="Velocity assigned to explicitly driven adhesive particles.",
+    )
+    parser.add_argument(
+        "--sticking-drive-mode",
+        choices=("teleport", "pd"),
+        default="pd",
+        help="Drive adhesive particles by position projection or by PD velocity updates.",
+    )
+    parser.add_argument(
+        "--sticking-update-phase",
+        choices=("before-step", "after-step"),
+        default="before-step",
+        help="Apply explicit sticking before or after the PhysX world step.",
+    )
+    parser.add_argument(
+        "--switch-sticking-on-contact-change",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Replace stored adhesive patches when the pressed contact pair changes.",
+    )
+    parser.add_argument(
+        "--sticking-pd-kp",
+        type=float,
+        default=80.0,
+        help="Position correction rate for PD adhesive sticking.",
+    )
+    parser.add_argument(
+        "--sticking-pd-kd",
+        type=float,
+        default=20.0,
+        help="Velocity-error damping rate for PD adhesive sticking.",
+    )
+    parser.add_argument(
+        "--sticking-pd-max-speed",
+        type=float,
+        default=1.5,
+        help="Maximum correction speed for PD adhesive sticking.",
+    )
+    parser.add_argument(
+        "--nonanchor-velocity-damping",
+        type=float,
+        default=TOY_NONANCHOR_VELOCITY_DAMPING,
+        help="Velocity multiplier for particles outside explicitly driven patches.",
     )
     parser.add_argument(
         "--adhesive-finger-friction",
@@ -243,6 +330,18 @@ def _parse_args():
     parser.add_argument("--renderer", default="RaytracedLighting")
     parser.add_argument("--rt-subframes", type=int, default=1)
     parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument(
+        "--table-static-friction",
+        type=float,
+        default=TABLE_PHYSICS_FRICTION[0],
+        help="Toy table static friction used by the physics material.",
+    )
+    parser.add_argument(
+        "--table-dynamic-friction",
+        type=float,
+        default=TABLE_PHYSICS_FRICTION[1],
+        help="Toy table dynamic friction used by the physics material.",
+    )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--result-json", type=Path)
     return parser.parse_args()
@@ -419,6 +518,7 @@ def _adhesive_surfaces(args):
             "local_u": (1.0, 0.0, 0.0),
             "local_v": (0.0, 0.0, 1.0),
             "local_normal": (0.0, 1.0, 0.0),
+            "half_extents": (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[2]),
             "radius": inner_radius,
             "contact_margin": ADHESIVE_CONTACT_MARGIN,
             "requires_closed_side": "pinch",
@@ -433,6 +533,7 @@ def _adhesive_surfaces(args):
             "local_u": (1.0, 0.0, 0.0),
             "local_v": (0.0, 0.0, 1.0),
             "local_normal": (0.0, -1.0, 0.0),
+            "half_extents": (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[2]),
             "radius": inner_radius,
             "contact_margin": ADHESIVE_CONTACT_MARGIN,
             "requires_closed_side": "pinch",
@@ -447,6 +548,7 @@ def _adhesive_surfaces(args):
             "local_u": (1.0, 0.0, 0.0),
             "local_v": (0.0, 1.0, 0.0),
             "local_normal": (0.0, 0.0, -1.0),
+            "half_extents": (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[1]),
             "radius": bottom_radius,
             "contact_margin": ADHESIVE_CONTACT_MARGIN,
             "requires_closed_side": "pinch",
@@ -461,6 +563,7 @@ def _adhesive_surfaces(args):
             "local_u": (1.0, 0.0, 0.0),
             "local_v": (0.0, 1.0, 0.0),
             "local_normal": (0.0, 0.0, -1.0),
+            "half_extents": (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[1]),
             "radius": bottom_radius,
             "contact_margin": ADHESIVE_CONTACT_MARGIN,
             "requires_closed_side": "pinch",
@@ -475,6 +578,7 @@ def _adhesive_surfaces(args):
             "local_u": (1.0, 0.0, 0.0),
             "local_v": (0.0, 1.0, 0.0),
             "local_normal": (0.0, 0.0, 1.0),
+            "half_extents": (0.5 * TABLE_SCALE[0], 0.5 * TABLE_SCALE[1]),
             "radius": table_radius,
             "contact_margin": ADHESIVE_CONTACT_MARGIN,
         },
@@ -511,10 +615,15 @@ def _surface_contact_torch(surface, particle_positions):
         particle_positions
         - frame["rotation"][:, 2] * local_positions[:, 2:3]
     )
-    mask = (
-        (normal_distance <= float(surface["contact_margin"]))
-        & (tangent_distance <= float(surface["radius"]))
-    )
+    half_extents = surface.get("half_extents")
+    if half_extents is None:
+        tangent_mask = tangent_distance <= float(surface["radius"])
+    else:
+        tangent_mask = (
+            (torch.abs(local_positions[:, 0]) <= float(half_extents[0]))
+            & (torch.abs(local_positions[:, 1]) <= float(half_extents[1]))
+        )
+    mask = (normal_distance <= float(surface["contact_margin"])) & tangent_mask
     score = normal_distance + 0.25 * tangent_distance
     return {
         "frame": frame,
@@ -577,6 +686,47 @@ def _is_finger_pinch_mode(mode: str) -> bool:
     return set(mode.split("+")) == {"left_inner_face", "right_inner_face"}
 
 
+def _expand_adhesive_patch_indices(
+    particle_positions,
+    seed_indices,
+    anchor_frame,
+    expanded_patch_radius: float,
+    expanded_patch_max_particles: int,
+    eligible_indices,
+):
+    if seed_indices.numel() == 0:
+        return seed_indices
+
+    local_positions = (
+        particle_positions - anchor_frame["origin"]
+    ) @ anchor_frame["rotation"]
+    seed_local_positions = local_positions[seed_indices]
+    tangent_center = torch.mean(seed_local_positions[:, :2], dim=0)
+    tangent_distance = torch.linalg.norm(
+        local_positions[:, :2] - tangent_center,
+        dim=1,
+    )
+    eligible_mask = torch.zeros(
+        particle_positions.shape[0],
+        dtype=torch.bool,
+        device=particle_positions.device,
+    )
+    eligible_mask[eligible_indices] = True
+    expanded_mask = (
+        tangent_distance <= float(expanded_patch_radius)
+    ) & eligible_mask
+    expanded_indices = torch.nonzero(expanded_mask, as_tuple=False).flatten()
+    if expanded_indices.numel() <= seed_indices.numel():
+        return seed_indices
+
+    if expanded_indices.numel() > int(expanded_patch_max_particles):
+        order = torch.argsort(tangent_distance[expanded_indices])[
+            :int(expanded_patch_max_particles)
+        ]
+        expanded_indices = expanded_indices[order]
+    return torch.unique(torch.cat((seed_indices, expanded_indices)))
+
+
 def _choose_adhesive_patch_torch(
     active_surfaces,
     particle_positions,
@@ -584,6 +734,8 @@ def _choose_adhesive_patch_torch(
     adhesive_pair_mode: str,
     adhesive_patch_max_particles: int,
     adhesive_local_patch_radius: float,
+    adhesive_expanded_patch_radius: float,
+    adhesive_expanded_patch_max_particles: int,
     required_anchor_name: str | None = None,
     excluded_indices=None,
 ):
@@ -656,15 +808,19 @@ def _choose_adhesive_patch_torch(
             candidate_local_positions = (
                 particle_positions[candidate_indices] - anchor_frame["origin"]
             ) @ anchor_frame["rotation"]
-            best_pair_order = torch.argsort(pair_score)
-            best_local_position = candidate_local_positions[best_pair_order[0]]
-            local_distances = torch.linalg.norm(
-                candidate_local_positions[:, :2] - best_local_position[:2],
-                dim=1,
-            )
-            local_mask = local_distances <= adhesive_local_patch_radius
-            local_candidate_indices = candidate_indices[local_mask]
-            local_pair_score = pair_score[local_mask]
+            if adhesive_local_patch_radius > 0.0:
+                best_pair_order = torch.argsort(pair_score)
+                best_local_position = candidate_local_positions[best_pair_order[0]]
+                local_distances = torch.linalg.norm(
+                    candidate_local_positions[:, :2] - best_local_position[:2],
+                    dim=1,
+                )
+                local_mask = local_distances <= adhesive_local_patch_radius
+                local_candidate_indices = candidate_indices[local_mask]
+                local_pair_score = pair_score[local_mask]
+            else:
+                local_candidate_indices = candidate_indices
+                local_pair_score = pair_score
             local_order = torch.argsort(local_pair_score)[:adhesive_patch_max_particles]
             seed_indices = local_candidate_indices[local_order]
             selected_indices = (
@@ -672,6 +828,9 @@ def _choose_adhesive_patch_torch(
                     particle_positions,
                     seed_indices,
                     anchor_frame,
+                    adhesive_expanded_patch_radius,
+                    adhesive_expanded_patch_max_particles,
+                    candidate_indices,
                 )
                 if expand_adhesive_patch
                 else seed_indices
@@ -709,6 +868,8 @@ def _choose_two_anchor_patches(
     adhesive_pair_mode: str,
     adhesive_patch_max_particles: int,
     adhesive_local_patch_radius: float,
+    adhesive_expanded_patch_radius: float,
+    adhesive_expanded_patch_max_particles: int,
     anchor_names,
 ):
     patches = []
@@ -725,6 +886,8 @@ def _choose_two_anchor_patches(
             adhesive_pair_mode,
             adhesive_patch_max_particles,
             adhesive_local_patch_radius,
+            adhesive_expanded_patch_radius,
+            adhesive_expanded_patch_max_particles,
             required_anchor_name=anchor_name,
             excluded_indices=excluded_indices,
         )
@@ -743,6 +906,8 @@ def _choose_two_finger_pregrasp_patches(
     expand_adhesive_patch: bool,
     adhesive_patch_max_particles: int,
     adhesive_local_patch_radius: float,
+    adhesive_expanded_patch_radius: float,
+    adhesive_expanded_patch_max_particles: int,
 ):
     return _choose_two_anchor_patches(
         active_surfaces,
@@ -751,6 +916,8 @@ def _choose_two_finger_pregrasp_patches(
         "any",
         adhesive_patch_max_particles,
         adhesive_local_patch_radius,
+        adhesive_expanded_patch_radius,
+        adhesive_expanded_patch_max_particles,
         ("left_bottom_face", "right_bottom_face"),
     )
 
@@ -761,6 +928,8 @@ def _choose_two_finger_inner_patches(
     expand_adhesive_patch: bool,
     adhesive_patch_max_particles: int,
     adhesive_local_patch_radius: float,
+    adhesive_expanded_patch_radius: float,
+    adhesive_expanded_patch_max_particles: int,
 ):
     return _choose_two_anchor_patches(
         active_surfaces,
@@ -769,6 +938,8 @@ def _choose_two_finger_inner_patches(
         "finger-pinch",
         adhesive_patch_max_particles,
         adhesive_local_patch_radius,
+        adhesive_expanded_patch_radius,
+        adhesive_expanded_patch_max_particles,
         ("left_inner_face", "right_inner_face"),
     )
 
@@ -783,9 +954,15 @@ def _project_attached_patches(
     fold_pairs,
     physics_dt: float,
     nonanchor_velocity_damping: float,
+    attached_velocity_mode: str,
+    sticking_drive_mode: str,
+    sticking_pd_kp: float,
+    sticking_pd_kd: float,
+    sticking_pd_max_speed: float,
 ):
     position_targets = positions.clone()
     velocity_targets = velocities.clone() * float(nonanchor_velocity_damping)
+    metrics = []
     for patch in patches:
         anchor_surface = surfaces_by_name[patch["anchor_name"]]
         anchor_frame = _surface_frame_tensors(anchor_surface, particle_positions)
@@ -793,22 +970,98 @@ def _project_attached_patches(
             patch["local_positions"] @ anchor_frame["rotation"].T
         ) + anchor_frame["origin"]
         selected_indices = patch["indices"]
-        position_targets[0, selected_indices] = target_positions
         previous_target_positions = patch.get("previous_target_positions")
-        if (
+        if attached_velocity_mode == "zero":
+            anchor_velocities = torch.zeros_like(target_positions)
+        elif (
             previous_target_positions is not None
             and previous_target_positions.shape == target_positions.shape
         ):
-            target_velocities = (
+            anchor_velocities = (
                 target_positions - previous_target_positions
             ) / float(physics_dt)
         else:
-            target_velocities = torch.zeros_like(target_positions)
-        velocity_targets[0, selected_indices] = target_velocities
+            anchor_velocities = torch.zeros_like(target_positions)
+        if sticking_drive_mode == "teleport":
+            position_targets[0, selected_indices] = target_positions
+            velocity_targets[0, selected_indices] = anchor_velocities
+            metrics.append(
+                {
+                    "mode": patch["mode"],
+                    "anchor_name": patch["anchor_name"],
+                    "particles": int(selected_indices.numel()),
+                }
+            )
+        else:
+            selected_positions = particle_positions[selected_indices]
+            selected_velocities = velocities[0, selected_indices]
+            position_errors = target_positions - selected_positions
+            velocity_errors = anchor_velocities - selected_velocities
+            position_response = min(
+                max(float(sticking_pd_kp) * float(physics_dt), 0.0),
+                1.0,
+            )
+            velocity_response = min(
+                max(float(sticking_pd_kd) * float(physics_dt), 0.0),
+                1.0,
+            )
+            raw_corrections = position_response * position_errors
+            correction_speed = torch.linalg.norm(
+                raw_corrections,
+                dim=1,
+                keepdim=True,
+            ) / float(physics_dt)
+            speed_scale = torch.clamp(
+                float(sticking_pd_max_speed)
+                / torch.clamp(correction_speed, min=1e-6),
+                max=1.0,
+            )
+            position_corrections = raw_corrections * speed_scale
+            next_positions = selected_positions + position_corrections
+            correction_velocities = position_corrections / float(physics_dt)
+            damping_velocities = velocity_response * velocity_errors
+            next_velocities = (
+                anchor_velocities
+                + correction_velocities
+                + damping_velocities
+            )
+            next_speed = torch.linalg.norm(next_velocities, dim=1, keepdim=True)
+            next_speed_scale = torch.clamp(
+                float(sticking_pd_max_speed)
+                / torch.clamp(next_speed, min=1e-6),
+                max=1.0,
+            )
+            position_targets[0, selected_indices] = next_positions
+            velocity_targets[0, selected_indices] = next_velocities * next_speed_scale
+            metrics.append(
+                {
+                    "mode": patch["mode"],
+                    "anchor_name": patch["anchor_name"],
+                    "particles": int(selected_indices.numel()),
+                    "position_error_mean_m": float(
+                        torch.mean(torch.linalg.norm(position_errors, dim=1)).item()
+                    ),
+                    "position_error_max_m": float(
+                        torch.max(torch.linalg.norm(position_errors, dim=1)).item()
+                    ),
+                    "correction_speed_mean_mps": float(
+                        torch.mean(correction_speed).item()
+                    ),
+                    "correction_speed_max_mps": float(
+                        torch.max(correction_speed).item()
+                    ),
+                    "velocity_mean_mps": float(torch.mean(next_speed).item()),
+                    "velocity_max_mps": float(torch.max(next_speed).item()),
+                    "speed_limited_particles": int(
+                        torch.count_nonzero(next_speed_scale[:, 0] < 0.999).item()
+                    ),
+                }
+            )
         patch["previous_target_positions"] = target_positions.detach().clone()
     _project_fold_pairs(position_targets, velocity_targets, fold_pairs, physics_dt)
     cloth_view.set_world_positions(position_targets)
     cloth_view.set_velocities(velocity_targets)
+    return metrics
 
 
 def _attached_patch_summaries(patches, particle_positions):
@@ -994,6 +1247,59 @@ def _project_fold_pairs(position_targets, velocity_targets, fold_pairs, physics_
     fold_pairs["previous_targets"] = next_targets.detach().clone()
 
 
+def _choose_current_adhesive_patches(
+    active_surfaces,
+    particle_positions,
+    expand_adhesive_patch: bool,
+    adhesive_pair_mode: str,
+    adhesive_patch_max_particles: int,
+    adhesive_local_patch_radius: float,
+    adhesive_expanded_patch_radius: float,
+    adhesive_expanded_patch_max_particles: int,
+    pregrasp_patch_count: str,
+):
+    if adhesive_pair_mode == "any" and pregrasp_patch_count == "two":
+        patches = _choose_two_finger_pregrasp_patches(
+            active_surfaces,
+            particle_positions,
+            expand_adhesive_patch,
+            adhesive_patch_max_particles,
+            adhesive_local_patch_radius,
+            adhesive_expanded_patch_radius,
+            adhesive_expanded_patch_max_particles,
+        )
+        return patches if len(patches) == 2 else []
+    if adhesive_pair_mode == "finger-pinch" and pregrasp_patch_count == "two":
+        patches = _choose_two_finger_inner_patches(
+            active_surfaces,
+            particle_positions,
+            expand_adhesive_patch,
+            adhesive_patch_max_particles,
+            adhesive_local_patch_radius,
+            adhesive_expanded_patch_radius,
+            adhesive_expanded_patch_max_particles,
+        )
+        return patches if len(patches) == 2 else []
+    active_grasp = _choose_adhesive_patch_torch(
+        active_surfaces,
+        particle_positions,
+        expand_adhesive_patch,
+        adhesive_pair_mode,
+        adhesive_patch_max_particles,
+        adhesive_local_patch_radius,
+        adhesive_expanded_patch_radius,
+        adhesive_expanded_patch_max_particles,
+    )
+    return [] if active_grasp is None else [active_grasp]
+
+
+def _patch_contact_keys(patches):
+    return sorted(
+        (patch["mode"], patch["anchor_name"])
+        for patch in patches
+    )
+
+
 def _drive_attached_patch(
     stage,
     cloth,
@@ -1004,6 +1310,8 @@ def _drive_attached_patch(
     adhesive_pair_mode: str,
     adhesive_patch_max_particles: int,
     adhesive_local_patch_radius: float,
+    adhesive_expanded_patch_radius: float,
+    adhesive_expanded_patch_max_particles: int,
     allow_new_attachment: bool,
     upgrade_to_finger_pinch: bool,
     handoff_to_inner_patches: bool,
@@ -1011,6 +1319,14 @@ def _drive_attached_patch(
     fold_cloth_sticking: bool,
     fold_cloth_max_pairs: int,
     fold_cloth_pair_distance: float,
+    pregrasp_patch_count: str,
+    attached_velocity_mode: str,
+    nonanchor_velocity_damping: float,
+    sticking_drive_mode: str,
+    sticking_pd_kp: float,
+    sticking_pd_kd: float,
+    sticking_pd_max_speed: float,
+    switch_sticking_on_contact_change: bool,
 ):
     cloth_view, positions, velocities, particle_positions, _particle_velocities = (
         _torch_cloth_state(cloth)
@@ -1031,24 +1347,17 @@ def _drive_attached_patch(
     if not active_patches:
         if not allow_new_attachment:
             return False
-        if adhesive_pair_mode == "any":
-            active_patches = _choose_two_finger_pregrasp_patches(
-                active_surfaces,
-                particle_positions,
-                expand_adhesive_patch,
-                adhesive_patch_max_particles,
-                adhesive_local_patch_radius,
-            )
-        else:
-            active_grasp = _choose_adhesive_patch_torch(
-                active_surfaces,
-                particle_positions,
-                expand_adhesive_patch,
-                adhesive_pair_mode,
-                adhesive_patch_max_particles,
-                adhesive_local_patch_radius,
-            )
-            active_patches = [] if active_grasp is None else [active_grasp]
+        active_patches = _choose_current_adhesive_patches(
+            active_surfaces,
+            particle_positions,
+            expand_adhesive_patch,
+            adhesive_pair_mode,
+            adhesive_patch_max_particles,
+            adhesive_local_patch_radius,
+            adhesive_expanded_patch_radius,
+            adhesive_expanded_patch_max_particles,
+            pregrasp_patch_count,
+        )
         if not active_patches:
             return False
         grasp_state["patches"] = active_patches
@@ -1068,6 +1377,35 @@ def _drive_attached_patch(
                 f"from {patch.get('seed_count', 'unknown')} contact seeds "
                 f"span={patch_summary['span_m']}"
             )
+    elif switch_sticking_on_contact_change and allow_new_attachment:
+        candidate_patches = _choose_current_adhesive_patches(
+            active_surfaces,
+            particle_positions,
+            expand_adhesive_patch,
+            adhesive_pair_mode,
+            adhesive_patch_max_particles,
+            adhesive_local_patch_radius,
+            adhesive_expanded_patch_radius,
+            adhesive_expanded_patch_max_particles,
+            pregrasp_patch_count,
+        )
+        if (
+            candidate_patches
+            and _patch_contact_keys(candidate_patches)
+            != _patch_contact_keys(active_patches)
+        ):
+            for patch in candidate_patches:
+                patch.pop("previous_target_positions", None)
+            grasp_state["patches"] = candidate_patches
+            grasp_state["fold_pairs"] = None
+            active_patches = candidate_patches
+            log_state["attached_particles"] = int(
+                sum(patch["indices"].numel() for patch in active_patches)
+            )
+            _log(
+                "switched adhesive patch to current pressed contact "
+                f"{_patch_contact_keys(active_patches)}"
+            )
     elif (
         upgrade_to_finger_pinch
         and len(active_patches) == 1
@@ -1081,6 +1419,8 @@ def _drive_attached_patch(
             "finger-pinch",
             adhesive_patch_max_particles,
             adhesive_local_patch_radius,
+            adhesive_expanded_patch_radius,
+            adhesive_expanded_patch_max_particles,
         )
         min_upgrade_particles = max(
             adhesive_patch_max_particles // 2,
@@ -1121,6 +1461,8 @@ def _drive_attached_patch(
             expand_adhesive_patch,
             adhesive_patch_max_particles,
             adhesive_local_patch_radius,
+            adhesive_expanded_patch_radius,
+            adhesive_expanded_patch_max_particles,
         )
         if len(inner_patches) == 2:
             inner_patches = _clamp_inner_patch_targets_to_gap(inner_patches)
@@ -1163,7 +1505,7 @@ def _drive_attached_patch(
                     f"{int(fold_pairs['indices'].shape[0])} particle pairs"
                 )
 
-    _project_attached_patches(
+    project_metrics = _project_attached_patches(
         cloth_view,
         positions,
         velocities,
@@ -1172,8 +1514,20 @@ def _drive_attached_patch(
         active_patches,
         grasp_state.get("fold_pairs"),
         TOY_PHYSICS_DT,
-        TOY_NONANCHOR_VELOCITY_DAMPING,
+        nonanchor_velocity_damping,
+        attached_velocity_mode,
+        sticking_drive_mode,
+        sticking_pd_kp,
+        sticking_pd_kd,
+        sticking_pd_max_speed,
     )
+    if project_metrics:
+        log_state.setdefault("pd_metrics", []).append(
+            {
+                "step": log_state["step"],
+                "patches": project_metrics,
+            }
+        )
     return True
 
 
@@ -1255,6 +1609,43 @@ def _diagnose_surface_contacts(active_surfaces, particle_positions):
     }
 
 
+def _summarize_pd_metrics(pd_metrics):
+    if not pd_metrics:
+        return None
+
+    patch_metrics = [
+        patch
+        for step_metrics in pd_metrics
+        for patch in step_metrics["patches"]
+        if "position_error_mean_m" in patch
+    ]
+    if not patch_metrics:
+        return None
+
+    def _max_value(key):
+        return max(float(patch[key]) for patch in patch_metrics)
+
+    def _mean_value(key):
+        return sum(float(patch[key]) for patch in patch_metrics) / len(patch_metrics)
+
+    return {
+        "samples": len(patch_metrics),
+        "position_error_mean_m": _mean_value("position_error_mean_m"),
+        "position_error_max_m": _max_value("position_error_max_m"),
+        "correction_speed_mean_mps": _mean_value("correction_speed_mean_mps"),
+        "correction_speed_max_mps": _max_value("correction_speed_max_mps"),
+        "velocity_mean_mps": _mean_value("velocity_mean_mps"),
+        "velocity_max_mps": _max_value("velocity_max_mps"),
+        "speed_limited_fraction": (
+            sum(
+                int(patch["speed_limited_particles"])
+                for patch in patch_metrics
+            )
+            / max(sum(int(patch["particles"]) for patch in patch_metrics), 1)
+        ),
+    }
+
+
 def _setup_writer(camera_path: str, args):
     if not args.record:
         return None, None
@@ -1332,14 +1723,14 @@ def main():
         table_physics_material = _create_physics_material(
             stage,
             "/World/Materials/TablePhysics",
-            TABLE_PHYSICS_FRICTION[0],
-            TABLE_PHYSICS_FRICTION[1],
+            args.table_static_friction,
+            args.table_dynamic_friction,
             TABLE_FRICTION_COMBINE_MODE,
         )
         _create_table(stage, table_material, table_physics_material)
 
         initial_y_offset = (
-            FINGER_CLOSED_Y_OFFSET
+            args.finger_closed_y_offset
             if args.start_closed
             else FINGER_START_Y_OFFSET
         )
@@ -1378,7 +1769,7 @@ def main():
             (TOY_CLOTH_CENTER[0], TOY_CLOTH_CENTER[1], 0.17),
             focal_length=22.0,
         )
-        if args.live_render:
+        if args.viewport_camera or args.live_render:
             try:
                 import omni.kit.viewport.utility
 
@@ -1468,7 +1859,7 @@ def main():
             release_stale_pregrasp = False
             closed_finger_y_offset = _lerp(
                 FINGER_START_Y_OFFSET,
-                FINGER_CLOSED_Y_OFFSET,
+                args.finger_closed_y_offset,
                 close_amount,
             )
             finger_y_offset = _lerp(
@@ -1485,8 +1876,8 @@ def main():
             else:
                 close_z = FINGER_PRESS_Z if lower_fraction >= 1.0 else press_z
             prelift_finger_z = close_z
-            lifted_finger_z = _lerp(prelift_finger_z, FINGER_LIFT_Z, lift_amount)
-            finger_z = _lerp(lifted_finger_z, FINGER_LIFT_Z, release_fraction)
+            lifted_finger_z = _lerp(prelift_finger_z, args.finger_lift_z, lift_amount)
+            finger_z = _lerp(lifted_finger_z, args.finger_lift_z, release_fraction)
             _set_finger_pose(
                 left_finger,
                 (FINGER_CENTER_X, TABLE_CENTER[1] - finger_y_offset, finger_z),
@@ -1505,34 +1896,52 @@ def main():
             )
 
             log_state["step"] = step
-            world.step(render=args.live_render)
+            attached = False
             if release_fraction > 0.0 and grasp_state["patches"]:
                 grasp_state["patches"] = []
                 grasp_state["fold_pairs"] = None
                 log_state["released_step"] = step
                 _log(f"released adhesive patches at step {step}")
-            attached = (
-                _drive_attached_patch(
-                    stage,
-                    cloth,
-                    surfaces,
-                    grasp_state,
-                    log_state,
-                    args.expand_adhesive_patch,
-                    adhesive_pair_mode,
-                    args.adhesive_patch_max_particles,
-                    args.adhesive_local_patch_radius,
-                    allow_new_attachment,
-                    upgrade_to_finger_pinch,
-                    handoff_to_inner_patches,
-                    release_stale_pregrasp,
-                    args.fold_cloth_sticking and close_fraction >= 1.0,
-                    args.fold_cloth_max_pairs,
-                    args.fold_cloth_pair_distance,
+
+            def _run_sticking_update():
+                return (
+                    _drive_attached_patch(
+                        stage,
+                        cloth,
+                        surfaces,
+                        grasp_state,
+                        log_state,
+                        args.expand_adhesive_patch,
+                        adhesive_pair_mode,
+                        args.adhesive_patch_max_particles,
+                        args.adhesive_local_patch_radius,
+                        args.adhesive_expanded_patch_radius,
+                        args.adhesive_expanded_patch_max_particles,
+                        allow_new_attachment,
+                        upgrade_to_finger_pinch,
+                        handoff_to_inner_patches,
+                        release_stale_pregrasp,
+                        args.fold_cloth_sticking and close_fraction >= 1.0,
+                        args.fold_cloth_max_pairs,
+                        args.fold_cloth_pair_distance,
+                        args.pregrasp_patch_count,
+                        args.attached_velocity_mode,
+                        args.nonanchor_velocity_damping,
+                        args.sticking_drive_mode,
+                        args.sticking_pd_kp,
+                        args.sticking_pd_kd,
+                        args.sticking_pd_max_speed,
+                        args.switch_sticking_on_contact_change,
+                    )
+                    if args.explicit_sticking and release_fraction <= 0.0
+                    else False
                 )
-                if args.explicit_sticking
-                else False
-            )
+
+            if args.sticking_update_phase == "before-step":
+                attached = _run_sticking_update()
+            world.step(render=args.live_render)
+            if args.sticking_update_phase == "after-step":
+                attached = _run_sticking_update()
             _cloth_view, _positions, _velocities, particle_positions, _particle_velocities = (
                 _torch_cloth_state(cloth)
             )
@@ -1552,6 +1961,12 @@ def main():
                     "step": step,
                     "finger_y_offset": finger_y_offset,
                     "finger_z": finger_z,
+                    "active_patch_summaries": _attached_patch_summaries(
+                        grasp_state["patches"],
+                        particle_positions,
+                    )
+                    if grasp_state["patches"]
+                    else [],
                     **_diagnose_surface_contacts(active_surfaces, particle_positions),
                 }
                 diagnostic_snapshots.append(diagnostic)
@@ -1645,6 +2060,28 @@ def main():
             "steps": args.steps,
             "start_closed": args.start_closed,
             "explicit_sticking": args.explicit_sticking,
+            "pregrasp_patch_count": args.pregrasp_patch_count,
+            "attached_velocity_mode": args.attached_velocity_mode,
+            "nonanchor_velocity_damping": args.nonanchor_velocity_damping,
+            "sticking_update_phase": args.sticking_update_phase,
+            "switch_sticking_on_contact_change": (
+                args.switch_sticking_on_contact_change
+            ),
+            "sticking_drive_mode": args.sticking_drive_mode,
+            "sticking_pd_kp": args.sticking_pd_kp,
+            "sticking_pd_kd": args.sticking_pd_kd,
+            "sticking_pd_max_speed": args.sticking_pd_max_speed,
+            "finger_lift_z": args.finger_lift_z,
+            "finger_closed_y_offset": args.finger_closed_y_offset,
+            "expand_adhesive_patch": args.expand_adhesive_patch,
+            "adhesive_patch_max_particles": args.adhesive_patch_max_particles,
+            "adhesive_local_patch_radius": args.adhesive_local_patch_radius,
+            "adhesive_expanded_patch_radius": args.adhesive_expanded_patch_radius,
+            "adhesive_expanded_patch_max_particles": (
+                args.adhesive_expanded_patch_max_particles
+            ),
+            "table_static_friction": args.table_static_friction,
+            "table_dynamic_friction": args.table_dynamic_friction,
             "attached_step": log_state["attached_step"],
             "attached_particles": log_state["attached_particles"],
             "released_step": log_state["released_step"],
@@ -1659,6 +2096,10 @@ def main():
             "attached_lift_m": attached_lift_m,
             "attached_to_cloth_slip_m": attached_to_cloth_slip_m,
             "whole_cloth_follow_ratio": whole_cloth_follow_ratio,
+            "pd_metric_summary": _summarize_pd_metrics(
+                log_state.get("pd_metrics", [])
+            ),
+            "pd_metrics_tail": log_state.get("pd_metrics", [])[-20:],
             "attached_patch_span_m": attached_patch_span_m,
             "attached_patch_summaries": attached_patch_summaries,
             "diagnostics": diagnostic_snapshots,
