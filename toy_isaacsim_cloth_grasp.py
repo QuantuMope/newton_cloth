@@ -30,15 +30,12 @@ import cloth_utils
 from isaacsim_newton_scene import (
     ADHESIVE_CONTACT_MARGIN,
     CLOTH_ADHESION_OFFSET_SCALE,
-    CLOTH_CONTACT_OFFSET,
     CLOTH_PARTICLE_ADHESION,
     CLOTH_PARTICLE_ADHESION_SCALE,
     CLOTH_PARTICLE_DAMPING,
     CLOTH_PARTICLE_FRICTION,
     CLOTH_PARTICLE_FRICTION_SCALE,
-    CLOTH_REST_OFFSET,
     GRIPPER_FINGER_COLLISION_BOX_SIZE,
-    GRIPPER_PHYSICS_FRICTION,
     GRIPPER_FRICTION_COMBINE_MODE,
     OBJECT_ADHESIVE_SURFACE_FRICTION,
     TABLE_CENTER,
@@ -68,16 +65,17 @@ TOY_CLOTH_CENTER = (-0.15, TABLE_CENTER[1], TABLE_CENTER[2] + 0.075)
 FINGER_CENTER_X = TOY_CLOTH_CENTER[0]
 FINGER_START_Y_OFFSET = 0.070
 # Keep a physical gap for folded cloth while preserving finger normal force.
-FINGER_CLOSED_Y_OFFSET = 0.008
-FINGER_PRESS_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.046
+FINGER_CLOSED_Y_OFFSET = 0.006
+FINGER_PRESS_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.043
 FINGER_START_Z = FINGER_PRESS_Z + 0.030
-FINGER_CLOSE_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.070
+FINGER_CLOSE_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.067
 FINGER_LIFT_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.220
 FINGER_INNER_ATTACH_NORMAL_OFFSET = 0.006
 ADHESIVE_PRESS_GAP = 0.024
-TOY_CLOTH_REST_OFFSET = 0.005
-TOY_CLOTH_CONTACT_OFFSET = 0.005
+TOY_CLOTH_REST_OFFSET = 0.003
+TOY_CLOTH_CONTACT_OFFSET = 0.003
 ADHESIVE_SIGNED_NORMAL_SLOP = TOY_CLOTH_CONTACT_OFFSET
+TOY_GRIPPER_PHYSICS_FRICTION = (0.1, 0.08)
 TOY_CLOTH_TOTAL_MASS = 0.050
 TOY_CLOTH_GRID_COLUMNS = 49 + 1
 TOY_CLOTH_GRID_ROWS = 33 + 1
@@ -326,6 +324,18 @@ def _parse_args():
         help="Maximum correction speed for PD adhesive sticking.",
     )
     parser.add_argument(
+        "--finger-static-friction",
+        type=float,
+        default=TOY_GRIPPER_PHYSICS_FRICTION[0],
+        help="Static friction for the physical toy finger contact material.",
+    )
+    parser.add_argument(
+        "--finger-dynamic-friction",
+        type=float,
+        default=TOY_GRIPPER_PHYSICS_FRICTION[1],
+        help="Dynamic friction for the physical toy finger contact material.",
+    )
+    parser.add_argument(
         "--nonanchor-velocity-damping",
         type=float,
         default=TOY_NONANCHOR_VELOCITY_DAMPING,
@@ -334,7 +344,7 @@ def _parse_args():
     parser.add_argument(
         "--adhesive-finger-friction",
         type=float,
-        default=GRIPPER_PHYSICS_FRICTION[0],
+        default=TOY_GRIPPER_PHYSICS_FRICTION[0],
         help="Material-ranking friction score for finger adhesive surfaces.",
     )
     parser.add_argument(
@@ -1865,6 +1875,67 @@ def _diagnose_surface_contacts(active_surfaces, particle_positions):
     }
 
 
+def _diagnose_named_surface_contacts(
+    active_surfaces,
+    particle_positions,
+    particle_velocities,
+    surface_names,
+):
+    import torch
+
+    summaries = {}
+    for surface in _surface_contacts_torch(active_surfaces, particle_positions):
+        name = surface["name"]
+        if name not in surface_names:
+            continue
+        contact = surface["contact"]
+        mask = contact["mask"]
+        mask_count = int(torch.count_nonzero(mask).item())
+        summary = {
+            "mask_count": mask_count,
+            "min_signed_normal_m": float(
+                torch.min(contact["signed_normal_distance"]).item()
+            ),
+            "min_abs_normal_m": float(torch.min(contact["normal_distance"]).item()),
+            "contact_margin_m": float(surface["contact_margin"]),
+            "half_extents_m": (
+                [float(surface["half_extents"][0]), float(surface["half_extents"][1])]
+                if surface.get("half_extents") is not None
+                else None
+            ),
+        }
+        if mask_count > 0:
+            selected_velocities = particle_velocities[mask]
+            local_velocities = selected_velocities @ contact["frame"]["rotation"]
+            selected_signed = contact["signed_normal_distance"][mask]
+            selected_tangent = contact["tangent_distance"][mask]
+            summary.update(
+                {
+                    "contact_inside_count": int(
+                        torch.count_nonzero(selected_signed < 0.0).item()
+                    ),
+                    "contact_signed_normal_min_m": float(
+                        torch.min(selected_signed).item()
+                    ),
+                    "contact_signed_normal_max_m": float(
+                        torch.max(selected_signed).item()
+                    ),
+                    "contact_tangent_max_m": float(torch.max(selected_tangent).item()),
+                    "mean_normal_velocity_mps": float(
+                        torch.mean(local_velocities[:, 2]).item()
+                    ),
+                    "mean_tangent_speed_mps": float(
+                        torch.mean(torch.linalg.norm(local_velocities[:, :2], dim=1)).item()
+                    ),
+                    "max_tangent_speed_mps": float(
+                        torch.max(torch.linalg.norm(local_velocities[:, :2], dim=1)).item()
+                    ),
+                }
+            )
+        summaries[name] = summary
+    return summaries
+
+
 def _summarize_pd_metrics(pd_metrics):
     if not pd_metrics:
         return None
@@ -1975,8 +2046,8 @@ def main():
         finger_physics_material = _create_physics_material(
             stage,
             "/World/Materials/FingerPhysics",
-            GRIPPER_PHYSICS_FRICTION[0],
-            GRIPPER_PHYSICS_FRICTION[1],
+            args.finger_static_friction,
+            args.finger_dynamic_friction,
             GRIPPER_FRICTION_COMBINE_MODE,
         )
         table_physics_material = _create_physics_material(
@@ -2232,6 +2303,17 @@ def main():
                         particle_positions,
                     ),
                     **_diagnose_surface_contacts(active_surfaces, particle_positions),
+                    "named_surface_contacts": _diagnose_named_surface_contacts(
+                        active_surfaces,
+                        particle_positions,
+                        _particle_velocities,
+                        {
+                            "left_inner_face",
+                            "right_inner_face",
+                            "left_outer_face",
+                            "right_outer_face",
+                        },
+                    ),
                 }
                 diagnostic_snapshots.append(diagnostic)
                 _log("diagnostic " + json.dumps(diagnostic, sort_keys=True))
@@ -2355,6 +2437,10 @@ def main():
             "adhesive_expanded_patch_max_particles": (
                 args.adhesive_expanded_patch_max_particles
             ),
+            "cloth_rest_offset": TOY_CLOTH_REST_OFFSET,
+            "cloth_contact_offset": TOY_CLOTH_CONTACT_OFFSET,
+            "finger_static_friction": args.finger_static_friction,
+            "finger_dynamic_friction": args.finger_dynamic_friction,
             "table_static_friction": args.table_static_friction,
             "table_dynamic_friction": args.table_dynamic_friction,
             "attached_step": log_state["attached_step"],
