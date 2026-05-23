@@ -82,7 +82,9 @@ TOY_CLOTH_REST_OFFSET = 0.005
 TOY_CLOTH_CONTACT_OFFSET = 0.005
 ADHESIVE_SIGNED_NORMAL_SLOP = TOY_CLOTH_CONTACT_OFFSET
 TOY_CLOTH_TOTAL_MASS = 0.050
-TOY_CLOTH_PARTICLE_COUNT = (49 + 1) * (33 + 1)
+TOY_CLOTH_GRID_COLUMNS = 49 + 1
+TOY_CLOTH_GRID_ROWS = 33 + 1
+TOY_CLOTH_PARTICLE_COUNT = TOY_CLOTH_GRID_COLUMNS * TOY_CLOTH_GRID_ROWS
 TOY_CLOTH_PARTICLE_MASS = TOY_CLOTH_TOTAL_MASS / TOY_CLOTH_PARTICLE_COUNT
 TOY_CLOTH_STRETCH_STIFFNESS = 6000.0
 TOY_CLOTH_BEND_STIFFNESS = 35.0
@@ -176,8 +178,20 @@ def _parse_args():
     parser.add_argument(
         "--adhesive-pair-mode",
         choices=("any", "finger-pinch"),
-        default="finger-pinch",
+        default="any",
         help="Use any compressed finger/object pair or only opposed finger inner faces.",
+    )
+    parser.add_argument(
+        "--adhesive-max-patches",
+        type=int,
+        default=10,
+        help="Maximum active adhesive patches selected from all valid surface pairs.",
+    )
+    parser.add_argument(
+        "--adhesive-components-per-pair",
+        type=int,
+        default=10,
+        help="Maximum disjoint cloth contact components retained per surface pair.",
     )
     parser.add_argument(
         "--adhesive-patch-max-particles",
@@ -233,7 +247,7 @@ def _parse_args():
     parser.add_argument(
         "--sticking-drive-mode",
         choices=("teleport", "pd"),
-        default="pd",
+        default="teleport",
         help="Drive adhesive particles by position projection or by PD velocity updates.",
     )
     parser.add_argument(
@@ -538,11 +552,15 @@ def _create_tabletop_cloth(stage, world, material):
 
 
 def _adhesive_surfaces(args):
-    inner_radius = float(
+    yz_radius = float(
+        math.hypot(0.5 * FINGER_SIZE[1], 0.5 * FINGER_SIZE[2])
+        + ADHESIVE_CONTACT_MARGIN
+    )
+    xz_radius = float(
         math.hypot(0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[2])
         + ADHESIVE_CONTACT_MARGIN
     )
-    bottom_radius = float(
+    xy_radius = float(
         math.hypot(0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[1])
         + ADHESIVE_CONTACT_MARGIN
     )
@@ -550,67 +568,157 @@ def _adhesive_surfaces(args):
         math.hypot(0.5 * TABLE_SCALE[0], 0.5 * TABLE_SCALE[1])
         + ADHESIVE_CONTACT_MARGIN
     )
+
+    def finger_surface(
+        name,
+        prim_path,
+        local_origin,
+        local_u,
+        local_v,
+        local_normal,
+        half_extents,
+        radius,
+    ):
+        return {
+            "name": name,
+            "kind": "finger",
+            "friction": args.adhesive_finger_friction,
+            "adhesion": args.adhesive_finger_adhesion,
+            "prim_path": prim_path,
+            "local_origin": local_origin,
+            "local_u": local_u,
+            "local_v": local_v,
+            "local_normal": local_normal,
+            "half_extents": half_extents,
+            "radius": radius,
+            "contact_margin": ADHESIVE_CONTACT_MARGIN,
+            "requires_closed_side": "pinch",
+        }
+
+    finger_surfaces = [
+        finger_surface(
+            "left_inner_face",
+            "/World/LeftFinger",
+            (0.0, 0.5, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (0.0, 1.0, 0.0),
+            (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[2]),
+            xz_radius,
+        ),
+        finger_surface(
+            "right_inner_face",
+            "/World/RightFinger",
+            (0.0, -0.5, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (0.0, -1.0, 0.0),
+            (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[2]),
+            xz_radius,
+        ),
+        finger_surface(
+            "left_outer_face",
+            "/World/LeftFinger",
+            (0.0, -0.5, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (0.0, -1.0, 0.0),
+            (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[2]),
+            xz_radius,
+        ),
+        finger_surface(
+            "right_outer_face",
+            "/World/RightFinger",
+            (0.0, 0.5, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (0.0, 1.0, 0.0),
+            (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[2]),
+            xz_radius,
+        ),
+        finger_surface(
+            "left_bottom_face",
+            "/World/LeftFinger",
+            (0.0, 0.0, -0.5),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, -1.0),
+            (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[1]),
+            xy_radius,
+        ),
+        finger_surface(
+            "right_bottom_face",
+            "/World/RightFinger",
+            (0.0, 0.0, -0.5),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, -1.0),
+            (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[1]),
+            xy_radius,
+        ),
+        finger_surface(
+            "left_top_face",
+            "/World/LeftFinger",
+            (0.0, 0.0, 0.5),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[1]),
+            xy_radius,
+        ),
+        finger_surface(
+            "right_top_face",
+            "/World/RightFinger",
+            (0.0, 0.0, 0.5),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[1]),
+            xy_radius,
+        ),
+        finger_surface(
+            "left_xneg_face",
+            "/World/LeftFinger",
+            (-0.5, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (-1.0, 0.0, 0.0),
+            (0.5 * FINGER_SIZE[1], 0.5 * FINGER_SIZE[2]),
+            yz_radius,
+        ),
+        finger_surface(
+            "right_xneg_face",
+            "/World/RightFinger",
+            (-0.5, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (-1.0, 0.0, 0.0),
+            (0.5 * FINGER_SIZE[1], 0.5 * FINGER_SIZE[2]),
+            yz_radius,
+        ),
+        finger_surface(
+            "left_xpos_face",
+            "/World/LeftFinger",
+            (0.5, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 0.0),
+            (0.5 * FINGER_SIZE[1], 0.5 * FINGER_SIZE[2]),
+            yz_radius,
+        ),
+        finger_surface(
+            "right_xpos_face",
+            "/World/RightFinger",
+            (0.5, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 0.0),
+            (0.5 * FINGER_SIZE[1], 0.5 * FINGER_SIZE[2]),
+            yz_radius,
+        ),
+    ]
     return [
-        {
-            "name": "left_inner_face",
-            "kind": "finger",
-            "friction": args.adhesive_finger_friction,
-            "adhesion": args.adhesive_finger_adhesion,
-            "prim_path": "/World/LeftFinger",
-            "local_origin": (0.0, 0.5, 0.0),
-            "local_u": (1.0, 0.0, 0.0),
-            "local_v": (0.0, 0.0, 1.0),
-            "local_normal": (0.0, 1.0, 0.0),
-            "half_extents": (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[2]),
-            "radius": inner_radius,
-            "contact_margin": ADHESIVE_CONTACT_MARGIN,
-            "requires_closed_side": "pinch",
-        },
-        {
-            "name": "right_inner_face",
-            "kind": "finger",
-            "friction": args.adhesive_finger_friction,
-            "adhesion": args.adhesive_finger_adhesion,
-            "prim_path": "/World/RightFinger",
-            "local_origin": (0.0, -0.5, 0.0),
-            "local_u": (1.0, 0.0, 0.0),
-            "local_v": (0.0, 0.0, 1.0),
-            "local_normal": (0.0, -1.0, 0.0),
-            "half_extents": (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[2]),
-            "radius": inner_radius,
-            "contact_margin": ADHESIVE_CONTACT_MARGIN,
-            "requires_closed_side": "pinch",
-        },
-        {
-            "name": "left_bottom_face",
-            "kind": "finger",
-            "friction": args.adhesive_finger_friction,
-            "adhesion": args.adhesive_finger_adhesion,
-            "prim_path": "/World/LeftFinger",
-            "local_origin": (0.0, 0.0, -0.5),
-            "local_u": (1.0, 0.0, 0.0),
-            "local_v": (0.0, 1.0, 0.0),
-            "local_normal": (0.0, 0.0, -1.0),
-            "half_extents": (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[1]),
-            "radius": bottom_radius,
-            "contact_margin": ADHESIVE_CONTACT_MARGIN,
-            "requires_closed_side": "pinch",
-        },
-        {
-            "name": "right_bottom_face",
-            "kind": "finger",
-            "friction": args.adhesive_finger_friction,
-            "adhesion": args.adhesive_finger_adhesion,
-            "prim_path": "/World/RightFinger",
-            "local_origin": (0.0, 0.0, -0.5),
-            "local_u": (1.0, 0.0, 0.0),
-            "local_v": (0.0, 1.0, 0.0),
-            "local_normal": (0.0, 0.0, -1.0),
-            "half_extents": (0.5 * FINGER_SIZE[0], 0.5 * FINGER_SIZE[1]),
-            "radius": bottom_radius,
-            "contact_margin": ADHESIVE_CONTACT_MARGIN,
-            "requires_closed_side": "pinch",
-        },
+        *finger_surfaces,
         {
             "name": "table_top",
             "kind": "object",
@@ -776,7 +884,128 @@ def _expand_adhesive_patch_indices(
     return torch.unique(torch.cat((seed_indices, expanded_indices)))
 
 
-def _choose_adhesive_patch_torch(
+def _connected_component_indices_grid(mask, max_components: int):
+    if torch.count_nonzero(mask).item() == 0:
+        return []
+    if mask.numel() != TOY_CLOTH_PARTICLE_COUNT:
+        return [torch.nonzero(mask, as_tuple=False).flatten()]
+
+    rows = TOY_CLOTH_GRID_ROWS
+    columns = TOY_CLOTH_GRID_COLUMNS
+    inactive_label = mask.numel()
+    active_grid = mask.reshape(rows, columns)
+    labels = torch.arange(mask.numel(), dtype=torch.long, device=mask.device).reshape(
+        rows,
+        columns,
+    )
+    inactive_labels = torch.full_like(labels, inactive_label)
+    labels = torch.where(active_grid, labels, inactive_labels)
+    for _iteration in range(rows + columns):
+        next_labels = labels.clone()
+        next_labels[1:, :] = torch.minimum(next_labels[1:, :], labels[:-1, :])
+        next_labels[:-1, :] = torch.minimum(next_labels[:-1, :], labels[1:, :])
+        next_labels[:, 1:] = torch.minimum(next_labels[:, 1:], labels[:, :-1])
+        next_labels[:, :-1] = torch.minimum(next_labels[:, :-1], labels[:, 1:])
+        labels = torch.where(active_grid, next_labels, inactive_labels)
+
+    flat_labels = labels.flatten()
+    active_labels = flat_labels[mask]
+    component_labels, component_counts = torch.unique(
+        active_labels,
+        sorted=False,
+        return_counts=True,
+    )
+    count_order = torch.argsort(component_counts, descending=True)
+    retained_labels = component_labels[count_order[:max_components]]
+    return [
+        torch.nonzero(flat_labels == component_label, as_tuple=False).flatten()
+        for component_label in retained_labels
+    ]
+
+
+def _make_adhesive_patch(
+    first_surface,
+    second_surface,
+    particle_positions,
+    candidate_indices,
+    pair_score,
+    expand_adhesive_patch: bool,
+    adhesive_patch_max_particles: int,
+    adhesive_local_patch_radius: float,
+    adhesive_expanded_patch_radius: float,
+    adhesive_expanded_patch_max_particles: int,
+    required_anchor_name: str | None = None,
+):
+    if candidate_indices.numel() == 0:
+        return None
+    anchor = _choose_adhesive_anchor(
+        first_surface,
+        second_surface,
+        candidate_indices,
+    )
+    if required_anchor_name is not None:
+        surfaces_by_name = {
+            first_surface["name"]: first_surface,
+            second_surface["name"]: second_surface,
+        }
+        anchor = surfaces_by_name.get(required_anchor_name)
+        if anchor is None:
+            return None
+    anchor_frame = anchor["torch_frame"]
+    component_pair_score = pair_score[candidate_indices]
+    candidate_local_positions = (
+        particle_positions[candidate_indices] - anchor_frame["origin"]
+    ) @ anchor_frame["rotation"]
+    if adhesive_local_patch_radius > 0.0:
+        best_pair_order = torch.argsort(component_pair_score)
+        best_local_position = candidate_local_positions[best_pair_order[0]]
+        local_distances = torch.linalg.norm(
+            candidate_local_positions[:, :2] - best_local_position[:2],
+            dim=1,
+        )
+        local_mask = local_distances <= adhesive_local_patch_radius
+        local_candidate_indices = candidate_indices[local_mask]
+        local_pair_score = component_pair_score[local_mask]
+    else:
+        local_candidate_indices = candidate_indices
+        local_pair_score = component_pair_score
+    if local_candidate_indices.numel() == 0:
+        return None
+    local_order = torch.argsort(local_pair_score)[:adhesive_patch_max_particles]
+    seed_indices = local_candidate_indices[local_order]
+    selected_indices = (
+        _expand_adhesive_patch_indices(
+            particle_positions,
+            seed_indices,
+            anchor_frame,
+            adhesive_expanded_patch_radius,
+            adhesive_expanded_patch_max_particles,
+            candidate_indices,
+        )
+        if expand_adhesive_patch
+        else seed_indices
+    )
+    local_positions = (
+        particle_positions[selected_indices] - anchor_frame["origin"]
+    ) @ anchor_frame["rotation"]
+    required_side = (
+        first_surface.get("requires_closed_side")
+        or second_surface.get("requires_closed_side")
+    )
+    return {
+        "mode": f"{first_surface['name']}+{second_surface['name']}",
+        "anchor_name": anchor["name"],
+        "anchor_kind": anchor["kind"],
+        "indices": selected_indices,
+        "local_positions": local_positions,
+        "requires_closed_side": required_side,
+        "score": torch.mean(local_pair_score[local_order]),
+        "seed_count": int(seed_indices.numel()),
+        "candidate_count": int(candidate_indices.numel()),
+    }
+
+
+def _choose_adhesive_patches_torch(
     active_surfaces,
     particle_positions,
     expand_adhesive_patch: bool,
@@ -785,6 +1014,8 @@ def _choose_adhesive_patch_torch(
     adhesive_local_patch_radius: float,
     adhesive_expanded_patch_radius: float,
     adhesive_expanded_patch_max_particles: int,
+    adhesive_max_patches: int,
+    adhesive_components_per_pair: int,
     required_anchor_name: str | None = None,
     excluded_indices=None,
 ):
@@ -798,7 +1029,7 @@ def _choose_adhesive_patch_torch(
     )
     if excluded_indices is not None and excluded_indices.numel() > 0:
         excluded_mask[excluded_indices] = True
-    best_patch = None
+    patches = []
     for first_index, first_surface in enumerate(contacts):
         for second_surface in contacts[first_index + 1:]:
             if first_surface["kind"] != "finger" and second_surface["kind"] != "finger":
@@ -836,81 +1067,68 @@ def _choose_adhesive_patch_torch(
                 )
                 & ~excluded_mask
             )
-            candidate_indices = torch.nonzero(combined_mask, as_tuple=False).flatten()
-            if candidate_indices.numel() == 0:
-                continue
             pair_score = (
-                first_surface["contact"]["score"][candidate_indices]
-                + second_surface["contact"]["score"][candidate_indices]
+                first_surface["contact"]["score"]
+                + second_surface["contact"]["score"]
             )
-            anchor = _choose_adhesive_anchor(
-                first_surface,
-                second_surface,
-                candidate_indices,
+            component_indices = _connected_component_indices_grid(
+                combined_mask,
+                adhesive_components_per_pair,
             )
-            if required_anchor_name is not None:
-                surfaces_by_name = {
-                    first_surface["name"]: first_surface,
-                    second_surface["name"]: second_surface,
-                }
-                anchor = surfaces_by_name.get(required_anchor_name)
-                if anchor is None:
-                    continue
-            anchor_frame = anchor["torch_frame"]
-            candidate_local_positions = (
-                particle_positions[candidate_indices] - anchor_frame["origin"]
-            ) @ anchor_frame["rotation"]
-            if adhesive_local_patch_radius > 0.0:
-                best_pair_order = torch.argsort(pair_score)
-                best_local_position = candidate_local_positions[best_pair_order[0]]
-                local_distances = torch.linalg.norm(
-                    candidate_local_positions[:, :2] - best_local_position[:2],
-                    dim=1,
-                )
-                local_mask = local_distances <= adhesive_local_patch_radius
-                local_candidate_indices = candidate_indices[local_mask]
-                local_pair_score = pair_score[local_mask]
-            else:
-                local_candidate_indices = candidate_indices
-                local_pair_score = pair_score
-            local_order = torch.argsort(local_pair_score)[:adhesive_patch_max_particles]
-            seed_indices = local_candidate_indices[local_order]
-            selected_indices = (
-                _expand_adhesive_patch_indices(
+            for candidate_indices in component_indices:
+                patch = _make_adhesive_patch(
+                    first_surface,
+                    second_surface,
                     particle_positions,
-                    seed_indices,
-                    anchor_frame,
+                    candidate_indices,
+                    pair_score,
+                    expand_adhesive_patch,
+                    adhesive_patch_max_particles,
+                    adhesive_local_patch_radius,
                     adhesive_expanded_patch_radius,
                     adhesive_expanded_patch_max_particles,
-                    candidate_indices,
+                    required_anchor_name,
                 )
-                if expand_adhesive_patch
-                else seed_indices
-            )
-            local_positions = (
-                particle_positions[selected_indices] - anchor_frame["origin"]
-            ) @ anchor_frame["rotation"]
-            patch = {
-                "mode": f"{first_surface['name']}+{second_surface['name']}",
-                "anchor_name": anchor["name"],
-                "anchor_kind": anchor["kind"],
-                "indices": selected_indices,
-                "local_positions": local_positions,
-                "requires_closed_side": required_side,
-                "score": torch.mean(local_pair_score[local_order]),
-                "seed_count": int(seed_indices.numel()),
-                "candidate_count": int(candidate_indices.numel()),
-            }
-            if best_patch is None:
-                best_patch = patch
-            elif selected_indices.numel() > best_patch["indices"].numel():
-                best_patch = patch
-            elif (
-                selected_indices.numel() == best_patch["indices"].numel()
-                and patch["score"].item() < best_patch["score"].item()
-            ):
-                best_patch = patch
-    return best_patch
+                if patch is not None:
+                    patches.append(patch)
+    patches.sort(
+        key=lambda patch: (
+            -int(patch["indices"].numel()),
+            float(patch["score"].item()),
+            patch["mode"],
+            patch["anchor_name"],
+        )
+    )
+    return patches[:adhesive_max_patches]
+
+
+def _choose_adhesive_patch_torch(
+    active_surfaces,
+    particle_positions,
+    expand_adhesive_patch: bool,
+    adhesive_pair_mode: str,
+    adhesive_patch_max_particles: int,
+    adhesive_local_patch_radius: float,
+    adhesive_expanded_patch_radius: float,
+    adhesive_expanded_patch_max_particles: int,
+    required_anchor_name: str | None = None,
+    excluded_indices=None,
+):
+    patches = _choose_adhesive_patches_torch(
+        active_surfaces,
+        particle_positions,
+        expand_adhesive_patch,
+        adhesive_pair_mode,
+        adhesive_patch_max_particles,
+        adhesive_local_patch_radius,
+        adhesive_expanded_patch_radius,
+        adhesive_expanded_patch_max_particles,
+        1,
+        1,
+        required_anchor_name,
+        excluded_indices,
+    )
+    return patches[0] if patches else None
 
 
 def _choose_two_anchor_patches(
@@ -1425,22 +1643,12 @@ def _choose_current_adhesive_patches(
     adhesive_local_patch_radius: float,
     adhesive_expanded_patch_radius: float,
     adhesive_expanded_patch_max_particles: int,
+    adhesive_max_patches: int,
+    adhesive_components_per_pair: int,
     pregrasp_patch_count: str,
     pinch_patch_count: str,
     excluded_indices=None,
 ):
-    if adhesive_pair_mode == "any" and pregrasp_patch_count == "two":
-        patches = _choose_two_finger_pregrasp_patches(
-            active_surfaces,
-            particle_positions,
-            expand_adhesive_patch,
-            adhesive_patch_max_particles,
-            adhesive_local_patch_radius,
-            adhesive_expanded_patch_radius,
-            adhesive_expanded_patch_max_particles,
-            excluded_indices,
-        )
-        return patches if len(patches) == 2 else []
     if adhesive_pair_mode == "finger-pinch" and pinch_patch_count == "two":
         patches = _choose_two_finger_inner_patches(
             active_surfaces,
@@ -1453,7 +1661,7 @@ def _choose_current_adhesive_patches(
             excluded_indices,
         )
         return patches if len(patches) == 2 else []
-    active_grasp = _choose_adhesive_patch_torch(
+    return _choose_adhesive_patches_torch(
         active_surfaces,
         particle_positions,
         expand_adhesive_patch,
@@ -1462,9 +1670,10 @@ def _choose_current_adhesive_patches(
         adhesive_local_patch_radius,
         adhesive_expanded_patch_radius,
         adhesive_expanded_patch_max_particles,
+        adhesive_max_patches,
+        adhesive_components_per_pair,
         excluded_indices=excluded_indices,
     )
-    return [] if active_grasp is None else [active_grasp]
 
 
 def _patch_contact_keys(patches):
@@ -1475,19 +1684,21 @@ def _patch_contact_keys(patches):
 
 
 def _copy_patch_velocity_history(candidate_patches, active_patches):
-    active_by_key = {
-        (patch["mode"], patch["anchor_name"]): patch
-        for patch in active_patches
-    }
     for candidate_patch in candidate_patches:
-        active_patch = active_by_key.get(
-            (candidate_patch["mode"], candidate_patch["anchor_name"])
+        active_patch = next(
+            (
+                patch
+                for patch in active_patches
+                if patch["mode"] == candidate_patch["mode"]
+                and patch["anchor_name"] == candidate_patch["anchor_name"]
+                and torch.equal(patch["indices"], candidate_patch["indices"])
+            ),
+            None,
         )
         if active_patch is None:
             continue
         previous_targets = active_patch.get("previous_target_positions")
-        same_indices = torch.equal(active_patch["indices"], candidate_patch["indices"])
-        if previous_targets is not None and same_indices:
+        if previous_targets is not None:
             candidate_patch["previous_target_positions"] = previous_targets
 
 
@@ -1560,10 +1771,11 @@ def _new_contact_patches(
     adhesive_local_patch_radius: float,
     adhesive_expanded_patch_radius: float,
     adhesive_expanded_patch_max_particles: int,
+    adhesive_max_patches: int,
+    adhesive_components_per_pair: int,
     pregrasp_patch_count: str,
     pinch_patch_count: str,
 ):
-    active_keys = set(_patch_contact_keys(active_patches))
     if active_patches:
         excluded_indices = torch.unique(
             torch.cat([patch["indices"] for patch in active_patches])
@@ -1579,15 +1791,13 @@ def _new_contact_patches(
         adhesive_local_patch_radius,
         adhesive_expanded_patch_radius,
         adhesive_expanded_patch_max_particles,
+        adhesive_max_patches,
+        adhesive_components_per_pair,
         pregrasp_patch_count,
         pinch_patch_count,
         excluded_indices,
     )
-    return [
-        patch
-        for patch in candidate_patches
-        if (patch["mode"], patch["anchor_name"]) not in active_keys
-    ]
+    return candidate_patches
 
 
 def _drive_attached_patch(
@@ -1602,6 +1812,8 @@ def _drive_attached_patch(
     adhesive_local_patch_radius: float,
     adhesive_expanded_patch_radius: float,
     adhesive_expanded_patch_max_particles: int,
+    adhesive_max_patches: int,
+    adhesive_components_per_pair: int,
     allow_new_attachment: bool,
     upgrade_to_finger_pinch: bool,
     handoff_to_inner_patches: bool,
@@ -1670,6 +1882,8 @@ def _drive_attached_patch(
             adhesive_local_patch_radius,
             adhesive_expanded_patch_radius,
             adhesive_expanded_patch_max_particles,
+            adhesive_max_patches,
+            adhesive_components_per_pair,
             pregrasp_patch_count,
             pinch_patch_count,
         )
@@ -1693,6 +1907,7 @@ def _drive_attached_patch(
                 f"span={patch_summary['span_m']}"
             )
     elif add_new_contact_patches and allow_new_attachment:
+        remaining_patch_slots = max(adhesive_max_patches - len(active_patches), 0)
         new_patches = _new_contact_patches(
             active_surfaces,
             particle_positions,
@@ -1703,6 +1918,8 @@ def _drive_attached_patch(
             adhesive_local_patch_radius,
             adhesive_expanded_patch_radius,
             adhesive_expanded_patch_max_particles,
+            remaining_patch_slots,
+            adhesive_components_per_pair,
             pregrasp_patch_count,
             pinch_patch_count,
         )
@@ -1737,6 +1954,8 @@ def _drive_attached_patch(
             adhesive_local_patch_radius,
             adhesive_expanded_patch_radius,
             adhesive_expanded_patch_max_particles,
+            adhesive_max_patches,
+            adhesive_components_per_pair,
             pregrasp_patch_count,
             pinch_patch_count,
         )
@@ -2196,7 +2415,7 @@ def main():
                     or close_fraction >= 1.0
                 )
             )
-            adhesive_pair_mode = "any" if pregrasp_active else args.adhesive_pair_mode
+            adhesive_pair_mode = args.adhesive_pair_mode
             upgrade_to_finger_pinch = (
                 args.upgrade_pregrasp_to_pinch
                 and close_fraction > 0.0
@@ -2261,6 +2480,8 @@ def main():
                         args.adhesive_local_patch_radius,
                         args.adhesive_expanded_patch_radius,
                         args.adhesive_expanded_patch_max_particles,
+                        args.adhesive_max_patches,
+                        args.adhesive_components_per_pair,
                         allow_new_attachment,
                         upgrade_to_finger_pinch,
                         handoff_to_inner_patches,
@@ -2417,6 +2638,9 @@ def main():
             "steps": args.steps,
             "start_closed": args.start_closed,
             "explicit_sticking": args.explicit_sticking,
+            "adhesive_pair_mode": args.adhesive_pair_mode,
+            "adhesive_max_patches": args.adhesive_max_patches,
+            "adhesive_components_per_pair": args.adhesive_components_per_pair,
             "pregrasp_patch_count": args.pregrasp_patch_count,
             "pinch_patch_count": args.pinch_patch_count,
             "attached_velocity_mode": args.attached_velocity_mode,
