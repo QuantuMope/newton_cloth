@@ -137,6 +137,12 @@ def _parse_args():
         default=False,
         help="Print adhesive sticking diagnostics and final result JSON.",
     )
+    parser.add_argument(
+        "--diagnostic-interval",
+        type=int,
+        default=15,
+        help="Step interval for result JSON diagnostic snapshots.",
+    )
     parser.add_argument("--steps", type=int, default=476)
     parser.add_argument(
         "--start-closed",
@@ -1040,6 +1046,120 @@ def _project_attached_patches(
 
 def _attached_patch_summaries(patches, particle_positions):
     return cloth_utils.attached_patch_summaries(patches, particle_positions)
+
+
+def _free_neighbor_indices(attached_indices, particle_count):
+    attached_flat = attached_indices.detach().flatten().to(torch.long)
+    attached_mask = torch.zeros(
+        particle_count,
+        dtype=torch.bool,
+        device=attached_flat.device,
+    )
+    attached_mask[attached_flat] = True
+    row = attached_flat // TOY_CLOTH_GRID_COLUMNS
+    col = attached_flat % TOY_CLOTH_GRID_COLUMNS
+    neighbor_candidates = []
+    if torch.count_nonzero(col > 0).item() > 0:
+        neighbor_candidates.append(attached_flat[col > 0] - 1)
+    if torch.count_nonzero(col < TOY_CLOTH_GRID_COLUMNS - 1).item() > 0:
+        neighbor_candidates.append(attached_flat[col < TOY_CLOTH_GRID_COLUMNS - 1] + 1)
+    if torch.count_nonzero(row > 0).item() > 0:
+        neighbor_candidates.append(attached_flat[row > 0] - TOY_CLOTH_GRID_COLUMNS)
+    if torch.count_nonzero(row < TOY_CLOTH_GRID_ROWS - 1).item() > 0:
+        neighbor_candidates.append(attached_flat[row < TOY_CLOTH_GRID_ROWS - 1] + TOY_CLOTH_GRID_COLUMNS)
+    if not neighbor_candidates:
+        return torch.empty(0, dtype=torch.long, device=attached_flat.device)
+    neighbors = torch.unique(torch.cat(neighbor_candidates))
+    return neighbors[~attached_mask[neighbors]]
+
+
+def _attachment_centroid_diagnostics(patches, particle_positions):
+    diagnostics = {
+        "cloth_centroid_z": float(torch.mean(particle_positions[:, 2]).item()),
+        "free_cloth_centroid_z": float(torch.mean(particle_positions[:, 2]).item()),
+        "attached_centroid_z": None,
+        "bottom_attached_centroid_z": None,
+        "inner_attached_centroid_z": None,
+        "boundary_free_centroid_z": None,
+        "bottom_boundary_free_centroid_z": None,
+        "inner_boundary_free_centroid_z": None,
+        "bottom_attached_particles": 0,
+        "inner_attached_particles": 0,
+        "boundary_free_particles": 0,
+        "bottom_boundary_free_particles": 0,
+        "inner_boundary_free_particles": 0,
+    }
+    if not patches:
+        return diagnostics
+    attached_indices = torch.unique(torch.cat([patch["indices"] for patch in patches]))
+    free_mask = torch.ones(
+        particle_positions.shape[0],
+        dtype=torch.bool,
+        device=particle_positions.device,
+    )
+    free_mask[attached_indices] = False
+    free_positions = particle_positions[free_mask]
+    if free_positions.numel() > 0:
+        diagnostics["free_cloth_centroid_z"] = float(
+            torch.mean(free_positions[:, 2]).item()
+        )
+    diagnostics["attached_centroid_z"] = float(
+        torch.mean(particle_positions[attached_indices, 2]).item()
+    )
+    boundary_indices = _free_neighbor_indices(
+        attached_indices,
+        particle_positions.shape[0],
+    )
+    if boundary_indices.numel() > 0:
+        diagnostics["boundary_free_particles"] = int(boundary_indices.numel())
+        diagnostics["boundary_free_centroid_z"] = float(
+            torch.mean(particle_positions[boundary_indices, 2]).item()
+        )
+    bottom_indices = [
+        patch["indices"]
+        for patch in patches
+        if patch["anchor_name"] in ("left_bottom_face", "right_bottom_face")
+    ]
+    inner_indices = [
+        patch["indices"]
+        for patch in patches
+        if patch["mode"] == "left_inner_face+right_inner_face"
+    ]
+    if bottom_indices:
+        unique_bottom_indices = torch.unique(torch.cat(bottom_indices))
+        diagnostics["bottom_attached_particles"] = int(unique_bottom_indices.numel())
+        diagnostics["bottom_attached_centroid_z"] = float(
+            torch.mean(particle_positions[unique_bottom_indices, 2]).item()
+        )
+        bottom_boundary_indices = _free_neighbor_indices(
+            unique_bottom_indices,
+            particle_positions.shape[0],
+        )
+        if bottom_boundary_indices.numel() > 0:
+            diagnostics["bottom_boundary_free_particles"] = int(
+                bottom_boundary_indices.numel()
+            )
+            diagnostics["bottom_boundary_free_centroid_z"] = float(
+                torch.mean(particle_positions[bottom_boundary_indices, 2]).item()
+            )
+    if inner_indices:
+        unique_inner_indices = torch.unique(torch.cat(inner_indices))
+        diagnostics["inner_attached_particles"] = int(unique_inner_indices.numel())
+        diagnostics["inner_attached_centroid_z"] = float(
+            torch.mean(particle_positions[unique_inner_indices, 2]).item()
+        )
+        inner_boundary_indices = _free_neighbor_indices(
+            unique_inner_indices,
+            particle_positions.shape[0],
+        )
+        if inner_boundary_indices.numel() > 0:
+            diagnostics["inner_boundary_free_particles"] = int(
+                inner_boundary_indices.numel()
+            )
+            diagnostics["inner_boundary_free_centroid_z"] = float(
+                torch.mean(particle_positions[inner_boundary_indices, 2]).item()
+            )
+    return diagnostics
 
 
 def _surface_selected_contact_diagnostic(surface, selected_indices):
@@ -2053,7 +2173,8 @@ def main():
                 if max_cloth_centroid_z is None
                 else max(max_cloth_centroid_z, cloth_centroid_z)
             )
-            if step % 15 == 0 or step == args.steps - 1:
+            diagnostic_interval = max(args.diagnostic_interval, 1)
+            if step % diagnostic_interval == 0 or step == args.steps - 1:
                 active_surfaces = _active_adhesive_surfaces(
                     stage,
                     surfaces,
@@ -2077,6 +2198,10 @@ def main():
                         )
                         if grasp_state["patches"]
                         else []
+                    ),
+                    **_attachment_centroid_diagnostics(
+                        grasp_state["patches"],
+                        particle_positions,
                     ),
                     **_diagnose_surface_contacts(active_surfaces, particle_positions),
                 }
