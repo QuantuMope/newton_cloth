@@ -63,16 +63,12 @@ from isaacsim_newton_scene import (
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = ROOT_DIR / "recordings" / "toy_isaacsim_cloth_grasp"
-FINGER_SIZE = (
-    GRIPPER_FINGER_COLLISION_BOX_SIZE[0],
-    GRIPPER_FINGER_COLLISION_BOX_SIZE[2],
-    GRIPPER_FINGER_COLLISION_BOX_SIZE[1],
-)
+FINGER_SIZE = (0.026, 0.002, GRIPPER_FINGER_COLLISION_BOX_SIZE[1])
 TOY_CLOTH_CENTER = (-0.15, TABLE_CENTER[1], TABLE_CENTER[2] + 0.075)
 FINGER_CENTER_X = TOY_CLOTH_CENTER[0]
 FINGER_START_Y_OFFSET = 0.070
 # Keep a physical gap for folded cloth while preserving finger normal force.
-FINGER_CLOSED_Y_OFFSET = 0.019
+FINGER_CLOSED_Y_OFFSET = 0.008
 FINGER_PRESS_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.046
 FINGER_START_Z = FINGER_PRESS_Z + 0.030
 FINGER_CLOSE_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.070
@@ -88,8 +84,8 @@ TOY_CLOTH_GRID_ROWS = 33 + 1
 TOY_CLOTH_PARTICLE_COUNT = TOY_CLOTH_GRID_COLUMNS * TOY_CLOTH_GRID_ROWS
 TOY_CLOTH_PARTICLE_MASS = TOY_CLOTH_TOTAL_MASS / TOY_CLOTH_PARTICLE_COUNT
 TOY_CLOTH_STRETCH_STIFFNESS = 6000.0
-TOY_CLOTH_BEND_STIFFNESS = 35.0
-TOY_CLOTH_SHEAR_STIFFNESS = 3000.0
+TOY_CLOTH_BEND_STIFFNESS = 10.0
+TOY_CLOTH_SHEAR_STIFFNESS = 2000.0
 TOY_CLOTH_SPRING_DAMPING = 8.0
 TOY_CLOTH_SOLVER_POSITION_ITERATIONS = 96
 TOY_NONANCHOR_VELOCITY_DAMPING = 0.94
@@ -208,6 +204,12 @@ def _parse_args():
         type=int,
         default=10,
         help="Maximum disjoint cloth contact components retained per surface pair.",
+    )
+    parser.add_argument(
+        "--adhesive-min-component-particles",
+        type=int,
+        default=3,
+        help="Minimum grid-connected contact particles needed to create a patch.",
     )
     parser.add_argument(
         "--adhesive-patch-max-particles",
@@ -824,6 +826,7 @@ def _connected_component_indices_grid(mask, max_components: int):
     return cloth_utils.connected_component_indices_grid(
         mask,
         max_components,
+        1,
         (TOY_CLOTH_GRID_ROWS, TOY_CLOTH_GRID_COLUMNS),
     )
 
@@ -867,6 +870,7 @@ def _choose_adhesive_patches_torch(
     adhesive_expanded_patch_max_particles: int,
     adhesive_max_patches: int,
     adhesive_components_per_pair: int,
+    adhesive_min_component_particles: int,
     required_anchor_name: str | None = None,
     excluded_indices=None,
 ):
@@ -881,6 +885,7 @@ def _choose_adhesive_patches_torch(
         adhesive_expanded_patch_max_particles=adhesive_expanded_patch_max_particles,
         adhesive_max_patches=adhesive_max_patches,
         adhesive_components_per_pair=adhesive_components_per_pair,
+        adhesive_min_component_particles=adhesive_min_component_particles,
         press_gap=ADHESIVE_PRESS_GAP,
         signed_normal_slop=ADHESIVE_SIGNED_NORMAL_SLOP,
         grid_shape=(TOY_CLOTH_GRID_ROWS, TOY_CLOTH_GRID_COLUMNS),
@@ -898,6 +903,7 @@ def _choose_adhesive_patch_torch(
     adhesive_local_patch_radius: float,
     adhesive_expanded_patch_radius: float,
     adhesive_expanded_patch_max_particles: int,
+    adhesive_min_component_particles: int,
     required_anchor_name: str | None = None,
     excluded_indices=None,
 ):
@@ -910,6 +916,7 @@ def _choose_adhesive_patch_torch(
         adhesive_local_patch_radius=adhesive_local_patch_radius,
         adhesive_expanded_patch_radius=adhesive_expanded_patch_radius,
         adhesive_expanded_patch_max_particles=adhesive_expanded_patch_max_particles,
+        adhesive_min_component_particles=adhesive_min_component_particles,
         press_gap=ADHESIVE_PRESS_GAP,
         signed_normal_slop=ADHESIVE_SIGNED_NORMAL_SLOP,
         grid_shape=(TOY_CLOTH_GRID_ROWS, TOY_CLOTH_GRID_COLUMNS),
@@ -927,6 +934,7 @@ def _choose_two_anchor_patches(
     adhesive_local_patch_radius: float,
     adhesive_expanded_patch_radius: float,
     adhesive_expanded_patch_max_particles: int,
+    adhesive_min_component_particles: int,
     anchor_names,
     excluded_indices=None,
 ):
@@ -947,6 +955,7 @@ def _choose_two_anchor_patches(
             adhesive_local_patch_radius,
             adhesive_expanded_patch_radius,
             adhesive_expanded_patch_max_particles,
+            adhesive_min_component_particles,
             required_anchor_name=anchor_name,
             excluded_indices=excluded_indices,
         )
@@ -967,6 +976,7 @@ def _choose_two_finger_pregrasp_patches(
     adhesive_local_patch_radius: float,
     adhesive_expanded_patch_radius: float,
     adhesive_expanded_patch_max_particles: int,
+    adhesive_min_component_particles: int,
     excluded_indices=None,
 ):
     return _choose_two_anchor_patches(
@@ -978,6 +988,7 @@ def _choose_two_finger_pregrasp_patches(
         adhesive_local_patch_radius,
         adhesive_expanded_patch_radius,
         adhesive_expanded_patch_max_particles,
+        adhesive_min_component_particles,
         ("left_bottom_face", "right_bottom_face"),
         excluded_indices,
     )
@@ -991,6 +1002,7 @@ def _choose_two_finger_inner_patches(
     adhesive_local_patch_radius: float,
     adhesive_expanded_patch_radius: float,
     adhesive_expanded_patch_max_particles: int,
+    adhesive_min_component_particles: int,
     excluded_indices=None,
 ):
     return _choose_two_anchor_patches(
@@ -1002,6 +1014,7 @@ def _choose_two_finger_inner_patches(
         adhesive_local_patch_radius,
         adhesive_expanded_patch_radius,
         adhesive_expanded_patch_max_particles,
+        adhesive_min_component_particles,
         ("left_inner_face", "right_inner_face"),
         excluded_indices,
     )
@@ -1351,6 +1364,7 @@ def _choose_current_adhesive_patches(
     adhesive_expanded_patch_max_particles: int,
     adhesive_max_patches: int,
     adhesive_components_per_pair: int,
+    adhesive_min_component_particles: int,
     pregrasp_patch_count: str,
     pinch_patch_count: str,
     excluded_indices=None,
@@ -1364,6 +1378,7 @@ def _choose_current_adhesive_patches(
             adhesive_local_patch_radius,
             adhesive_expanded_patch_radius,
             adhesive_expanded_patch_max_particles,
+            adhesive_min_component_particles,
             excluded_indices,
         )
         return patches if len(patches) == 2 else []
@@ -1378,6 +1393,7 @@ def _choose_current_adhesive_patches(
         adhesive_expanded_patch_max_particles,
         adhesive_max_patches,
         adhesive_components_per_pair,
+        adhesive_min_component_particles,
         excluded_indices=excluded_indices,
     )
 
@@ -1403,12 +1419,14 @@ def _filter_active_patches_by_current_contact(
     active_surfaces,
     particle_positions,
     active_patches,
+    adhesive_min_component_particles: int,
 ):
     return cloth_utils.filter_active_patches_by_current_contact(
         active_surfaces,
         particle_positions,
         active_patches,
         press_gap=ADHESIVE_PRESS_GAP,
+        min_component_particles=adhesive_min_component_particles,
         signed_normal_slop=ADHESIVE_SIGNED_NORMAL_SLOP,
     )
 
@@ -1425,6 +1443,7 @@ def _new_contact_patches(
     adhesive_expanded_patch_max_particles: int,
     adhesive_max_patches: int,
     adhesive_components_per_pair: int,
+    adhesive_min_component_particles: int,
     pregrasp_patch_count: str,
     pinch_patch_count: str,
 ):
@@ -1445,6 +1464,7 @@ def _new_contact_patches(
         adhesive_expanded_patch_max_particles,
         adhesive_max_patches,
         adhesive_components_per_pair,
+        adhesive_min_component_particles,
         pregrasp_patch_count,
         pinch_patch_count,
         excluded_indices,
@@ -1466,6 +1486,7 @@ def _drive_attached_patch(
     adhesive_expanded_patch_max_particles: int,
     adhesive_max_patches: int,
     adhesive_components_per_pair: int,
+    adhesive_min_component_particles: int,
     allow_new_attachment: bool,
     upgrade_to_finger_pinch: bool,
     handoff_to_inner_patches: bool,
@@ -1507,6 +1528,7 @@ def _drive_attached_patch(
             active_surfaces,
             particle_positions,
             active_patches,
+            adhesive_min_component_particles,
         )
         if release_events:
             for patch, pressed_count, original_count in release_events:
@@ -1536,6 +1558,7 @@ def _drive_attached_patch(
             adhesive_expanded_patch_max_particles,
             adhesive_max_patches,
             adhesive_components_per_pair,
+            adhesive_min_component_particles,
             pregrasp_patch_count,
             pinch_patch_count,
         )
@@ -1572,6 +1595,7 @@ def _drive_attached_patch(
             adhesive_expanded_patch_max_particles,
             remaining_patch_slots,
             adhesive_components_per_pair,
+            adhesive_min_component_particles,
             pregrasp_patch_count,
             pinch_patch_count,
         )
@@ -1608,6 +1632,7 @@ def _drive_attached_patch(
             adhesive_expanded_patch_max_particles,
             adhesive_max_patches,
             adhesive_components_per_pair,
+            adhesive_min_component_particles,
             pregrasp_patch_count,
             pinch_patch_count,
         )
@@ -1650,6 +1675,7 @@ def _drive_attached_patch(
             adhesive_local_patch_radius,
             adhesive_expanded_patch_radius,
             adhesive_expanded_patch_max_particles,
+            adhesive_min_component_particles,
         )
         min_upgrade_particles = max(
             adhesive_patch_max_particles // 2,
@@ -1692,6 +1718,7 @@ def _drive_attached_patch(
             adhesive_local_patch_radius,
             adhesive_expanded_patch_radius,
             adhesive_expanded_patch_max_particles,
+            adhesive_min_component_particles,
         )
         if len(inner_patches) == 2:
             inner_patches = _clamp_inner_patch_targets_to_gap(inner_patches)
@@ -2135,6 +2162,7 @@ def main():
                         args.adhesive_expanded_patch_max_particles,
                         args.adhesive_max_patches,
                         args.adhesive_components_per_pair,
+                        args.adhesive_min_component_particles,
                         allow_new_attachment,
                         upgrade_to_finger_pinch,
                         handoff_to_inner_patches,
@@ -2299,6 +2327,9 @@ def main():
             "adhesive_pair_mode": args.adhesive_pair_mode,
             "adhesive_max_patches": args.adhesive_max_patches,
             "adhesive_components_per_pair": args.adhesive_components_per_pair,
+            "adhesive_min_component_particles": (
+                args.adhesive_min_component_particles
+            ),
             "pregrasp_patch_count": args.pregrasp_patch_count,
             "pinch_patch_count": args.pinch_patch_count,
             "attached_velocity_mode": args.attached_velocity_mode,

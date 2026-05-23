@@ -379,6 +379,7 @@ def expand_adhesive_patch_indices(
 def connected_component_indices_grid(
     mask: torch.Tensor,
     max_components: int,
+    min_component_particles: int = 1,
     grid_shape: tuple[int, int] | None = None,
 ) -> list[torch.Tensor]:
     """Return largest connected components from a flattened cloth-grid mask.
@@ -418,7 +419,11 @@ def connected_component_indices_grid(
         return_counts=True,
     )
     count_order = torch.argsort(component_counts, descending=True)
-    retained_labels = component_labels[count_order[:max_components]]
+    ordered_counts = component_counts[count_order]
+    large_enough_order = count_order[
+        ordered_counts >= max(int(min_component_particles), 1)
+    ]
+    retained_labels = component_labels[large_enough_order[:max_components]]
     return [
         torch.nonzero(flat_labels == component_label, as_tuple=False).flatten()
         for component_label in retained_labels
@@ -519,6 +524,7 @@ def choose_adhesive_patches_torch(
     adhesive_expanded_patch_max_particles: int,
     adhesive_max_patches: int,
     adhesive_components_per_pair: int,
+    adhesive_min_component_particles: int = 1,
     press_gap: float,
     signed_normal_slop: float | None = None,
     grid_shape: tuple[int, int] | None = None,
@@ -574,6 +580,7 @@ def choose_adhesive_patches_torch(
             component_indices = connected_component_indices_grid(
                 combined_mask,
                 adhesive_components_per_pair,
+                adhesive_min_component_particles,
                 grid_shape,
             )
             for candidate_indices in component_indices:
@@ -657,6 +664,105 @@ def choose_anchor_patches(
     return patches
 
 
+def _surface_pair_normal_velocity_filter(
+    patch: dict,
+    surfaces_by_name: dict[str, dict],
+    particle_positions: torch.Tensor,
+    candidate_velocities: torch.Tensor,
+    fallback_velocities: torch.Tensor,
+    physics_dt: float,
+) -> tuple[torch.Tensor, dict]:
+    """Remove one-sided pair-normal surface velocity from cloth targets.
+
+    The adhesive projection can safely inherit tangential motion from the anchor
+    surface, such as lifting a pinched fold upward. Normal motion is different:
+    if only one plane in a compressed surface pair moves along the pair normal,
+    that plane is separating from or scraping across the other one and assigning
+    the same normal velocity to the cloth injects release energy. Transfer the
+    pair-normal component only when both planes have frame motion in the same
+    normal direction; otherwise keep the cloth's existing normal velocity.
+    """
+
+    surface_names = patch.get("mode", "").split("+")
+    if len(surface_names) != 2 or patch["anchor_name"] not in surface_names:
+        return candidate_velocities, {
+            "normal_velocity_filtered": False,
+            "normal_velocity_reason": "not_surface_pair",
+        }
+    if any(name not in surfaces_by_name for name in surface_names):
+        return candidate_velocities, {
+            "normal_velocity_filtered": False,
+            "normal_velocity_reason": "missing_surface",
+        }
+
+    anchor_name = patch["anchor_name"]
+    other_name = surface_names[1] if surface_names[0] == anchor_name else surface_names[0]
+    anchor_frame = surface_frame_tensors(
+        surfaces_by_name[anchor_name],
+        particle_positions,
+    )
+    other_frame = surface_frame_tensors(
+        surfaces_by_name[other_name],
+        particle_positions,
+    )
+    current_origins = {
+        anchor_name: anchor_frame["origin"].detach().clone(),
+        other_name: other_frame["origin"].detach().clone(),
+    }
+    previous_origins = patch.get("previous_surface_origins", {})
+    previous_anchor_origin = previous_origins.get(anchor_name)
+    previous_other_origin = previous_origins.get(other_name)
+    if previous_anchor_origin is None or previous_other_origin is None:
+        return candidate_velocities, {
+            "normal_velocity_filtered": False,
+            "normal_velocity_reason": "missing_previous_surface_origin",
+            "current_surface_origins": current_origins,
+        }
+
+    pair_normal = anchor_frame["rotation"][:, 2]
+    anchor_surface_velocity = (
+        current_origins[anchor_name] - previous_anchor_origin.to(pair_normal.device)
+    ) / float(physics_dt)
+    other_surface_velocity = (
+        current_origins[other_name] - previous_other_origin.to(pair_normal.device)
+    ) / float(physics_dt)
+    anchor_normal_speed = float(torch.dot(anchor_surface_velocity, pair_normal).item())
+    other_normal_speed = float(torch.dot(other_surface_velocity, pair_normal).item())
+    normal_epsilon = 1e-6
+    same_direction = (
+        abs(anchor_normal_speed) <= normal_epsilon
+        or (
+            abs(other_normal_speed) > normal_epsilon
+            and anchor_normal_speed * other_normal_speed > 0.0
+        )
+    )
+    if same_direction:
+        return candidate_velocities, {
+            "normal_velocity_filtered": False,
+            "normal_velocity_reason": "paired_surface_motion",
+            "current_surface_origins": current_origins,
+            "anchor_normal_speed_mps": anchor_normal_speed,
+            "other_normal_speed_mps": other_normal_speed,
+        }
+
+    normal = pair_normal.reshape(1, 3)
+    candidate_normal = torch.sum(candidate_velocities * normal, dim=1, keepdim=True)
+    fallback_normal = torch.sum(fallback_velocities * normal, dim=1, keepdim=True)
+    filtered_velocities = (
+        candidate_velocities
+        - candidate_normal * normal
+        + fallback_normal * normal
+    )
+    return filtered_velocities, {
+        "normal_velocity_filtered": True,
+        "normal_velocity_reason": "one_sided_surface_motion",
+        "current_surface_origins": current_origins,
+        "anchor_normal_speed_mps": anchor_normal_speed,
+        "other_normal_speed_mps": other_normal_speed,
+        "normal_velocity_removed_mean_mps": float(torch.mean(candidate_normal).item()),
+    }
+
+
 def project_attached_patches(
     cloth_view,
     positions: torch.Tensor,
@@ -703,6 +809,20 @@ def project_attached_patches(
             ) / float(physics_dt)
         else:
             anchor_velocities = torch.zeros_like(target_positions)
+        selected_velocities = velocities[0, selected_indices]
+        fallback_velocities = selected_velocities * float(nonanchor_velocity_damping)
+        anchor_velocities, normal_filter_info = _surface_pair_normal_velocity_filter(
+            patch,
+            surfaces_by_name,
+            particle_positions,
+            anchor_velocities,
+            fallback_velocities,
+            physics_dt,
+        )
+        current_surface_origins = normal_filter_info.pop(
+            "current_surface_origins",
+            None,
+        )
 
         if sticking_drive_mode == "teleport":
             position_targets[0, selected_indices] = target_positions
@@ -712,11 +832,11 @@ def project_attached_patches(
                     "mode": patch["mode"],
                     "anchor_name": patch["anchor_name"],
                     "particles": int(selected_indices.numel()),
+                    **normal_filter_info,
                 }
             )
         else:
             selected_positions = particle_positions[selected_indices]
-            selected_velocities = velocities[0, selected_indices]
             position_errors = target_positions - selected_positions
             velocity_errors = anchor_velocities - selected_velocities
             position_response = min(
@@ -746,6 +866,25 @@ def project_attached_patches(
                 anchor_velocities
                 + correction_velocities
                 + damping_velocities
+            )
+            next_velocities, next_normal_filter_info = (
+                _surface_pair_normal_velocity_filter(
+                    patch,
+                    surfaces_by_name,
+                    particle_positions,
+                    next_velocities,
+                    fallback_velocities,
+                    physics_dt,
+                )
+            )
+            next_current_surface_origins = next_normal_filter_info.pop(
+                "current_surface_origins",
+                None,
+            )
+            current_surface_origins = (
+                next_current_surface_origins
+                if next_current_surface_origins is not None
+                else current_surface_origins
             )
             next_speed = torch.linalg.norm(next_velocities, dim=1, keepdim=True)
             next_speed_scale = torch.clamp(
@@ -777,9 +916,12 @@ def project_attached_patches(
                     "speed_limited_particles": int(
                         torch.count_nonzero(next_speed_scale[:, 0] < 0.999).item()
                     ),
+                    **next_normal_filter_info,
                 }
             )
         patch["previous_target_positions"] = target_positions.detach().clone()
+        if current_surface_origins is not None:
+            patch["previous_surface_origins"] = current_surface_origins
 
     if fold_pair_projector is not None:
         fold_pair_projector(position_targets, velocity_targets)
@@ -970,6 +1112,9 @@ def copy_patch_velocity_history(
         previous_targets = active_patch.get("previous_target_positions")
         if previous_targets is not None:
             candidate_patch["previous_target_positions"] = previous_targets
+        previous_surface_origins = active_patch.get("previous_surface_origins")
+        if previous_surface_origins is not None:
+            candidate_patch["previous_surface_origins"] = previous_surface_origins
 
 
 def patch_current_pressed_mask(
@@ -1008,6 +1153,7 @@ def filter_active_patches_by_current_contact(
     active_patches: Sequence[dict],
     *,
     press_gap: float,
+    min_component_particles: int = 1,
     signed_normal_slop: float | None = None,
 ) -> tuple[list[dict], list[tuple[dict, int, int]]]:
     """Prune or release active patches that lost their original compression."""
@@ -1030,7 +1176,7 @@ def filter_active_patches_by_current_contact(
             continue
         pressed_count = int(torch.count_nonzero(pressed_mask).item())
         original_count = int(patch["indices"].numel())
-        if pressed_count == 0:
+        if pressed_count < max(int(min_component_particles), 1):
             release_events.append((patch, pressed_count, original_count))
             continue
         if pressed_count == original_count:
