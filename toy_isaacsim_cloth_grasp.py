@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+import cloth_utils
 from isaacsim_newton_scene import (
     ADHESIVE_CONTACT_MARGIN,
     CLOTH_ADHESION_OFFSET_SCALE,
@@ -94,9 +95,12 @@ TOY_CLOTH_SOLVER_POSITION_ITERATIONS = 96
 TOY_NONANCHOR_VELOCITY_DAMPING = 0.94
 TOY_FOLD_PAIR_STRENGTH = 0.60
 TOY_PHYSICS_DT = 1.0 / 120.0
+TOY_STICKING_DEBUG = False
 
 
 def _log(message: str):
+    if not TOY_STICKING_DEBUG:
+        return
     print(f"[toy_isaacsim_cloth_grasp] {message}", file=sys.stderr, flush=True)
 
 
@@ -126,6 +130,12 @@ def _parse_args():
         type=float,
         default=0.05,
         help="Sleep after live-rendered steps so the scripted motion is watchable.",
+    )
+    parser.add_argument(
+        "--sticking-debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print adhesive sticking diagnostics and final result JSON.",
     )
     parser.add_argument("--steps", type=int, default=476)
     parser.add_argument(
@@ -746,101 +756,44 @@ def _torch_cloth_state(cloth):
 
 
 def _surface_frame_tensors(surface, particle_positions):
-    import torch
-
-    device = particle_positions.device
-    dtype = particle_positions.dtype
-    frame = surface["frame"]
-    return {
-        "origin": torch.as_tensor(frame["origin"], dtype=dtype, device=device),
-        "rotation": torch.as_tensor(frame["rotation"], dtype=dtype, device=device),
-    }
+    return cloth_utils.surface_frame_tensors(surface, particle_positions)
 
 
 def _surface_contact_torch(surface, particle_positions):
-    frame = _surface_frame_tensors(surface, particle_positions)
-    local_positions = (particle_positions - frame["origin"]) @ frame["rotation"]
-    tangent_distance = torch.linalg.norm(local_positions[:, :2], dim=1)
-    normal_distance = torch.abs(local_positions[:, 2])
-    closest_points = (
-        particle_positions
-        - frame["rotation"][:, 2] * local_positions[:, 2:3]
-    )
-    half_extents = surface.get("half_extents")
-    if half_extents is None:
-        tangent_mask = tangent_distance <= float(surface["radius"])
-    else:
-        tangent_mask = (
-            (torch.abs(local_positions[:, 0]) <= float(half_extents[0]))
-            & (torch.abs(local_positions[:, 1]) <= float(half_extents[1]))
-        )
-    mask = (normal_distance <= float(surface["contact_margin"])) & tangent_mask
-    score = normal_distance + 0.25 * tangent_distance
-    return {
-        "frame": frame,
-        "local_positions": local_positions,
-        "tangent_distance": tangent_distance,
-        "signed_normal_distance": local_positions[:, 2],
-        "normal_distance": normal_distance,
-        "closest_points": closest_points,
-        "mask": mask,
-        "score": score,
-    }
+    return cloth_utils.surface_contact_torch(surface, particle_positions)
 
 
 def _surface_contacts_torch(active_surfaces, particle_positions):
-    return [
-        {
-            **surface,
-            "torch_frame": _surface_frame_tensors(surface, particle_positions),
-            "contact": _surface_contact_torch(surface, particle_positions),
-        }
-        for surface in active_surfaces
-    ]
+    return cloth_utils.surface_contacts_torch(active_surfaces, particle_positions)
 
 
 def _surfaces_are_opposed(first_surface, second_surface, particle_positions):
-    first_normal = first_surface["torch_frame"]["rotation"][:, 2]
-    second_normal = second_surface["torch_frame"]["rotation"][:, 2]
-    return bool(torch.dot(first_normal, second_normal).item() < -0.35)
+    return cloth_utils.surfaces_are_opposed(first_surface, second_surface)
 
 
 def _pressed_between_surfaces_torch(first_contact, second_contact):
-    import torch
-
-    surface_gap = torch.linalg.norm(
-        first_contact["closest_points"] - second_contact["closest_points"],
-        dim=1,
+    return cloth_utils.pressed_between_surfaces_torch(
+        first_contact,
+        second_contact,
+        ADHESIVE_PRESS_GAP,
+        ADHESIVE_SIGNED_NORMAL_SLOP,
     )
-    between_normals = (
-        first_contact["signed_normal_distance"] >= -ADHESIVE_SIGNED_NORMAL_SLOP
-    ) & (
-        second_contact["signed_normal_distance"] >= -ADHESIVE_SIGNED_NORMAL_SLOP
-    )
-    return (surface_gap <= ADHESIVE_PRESS_GAP) & between_normals
 
 
 def _surface_candidate_distance(surface, candidate_indices):
-    if candidate_indices is None or candidate_indices.numel() == 0:
-        return float("inf")
-    return float(
-        torch.mean(surface["contact"]["normal_distance"][candidate_indices]).item()
-    )
+    return cloth_utils.surface_candidate_distance(surface, candidate_indices)
 
 
 def _choose_adhesive_anchor(first_surface, second_surface, candidate_indices):
-    return max(
-        (first_surface, second_surface),
-        key=lambda surface: (
-            surface.get("adhesion", 0.0),
-            surface.get("friction", 0.0),
-            -_surface_candidate_distance(surface, candidate_indices),
-        ),
+    return cloth_utils.choose_adhesive_anchor(
+        first_surface,
+        second_surface,
+        candidate_indices,
     )
 
 
 def _is_finger_pinch_mode(mode: str) -> bool:
-    return set(mode.split("+")) == {"left_inner_face", "right_inner_face"}
+    return cloth_utils.is_finger_pinch_mode(mode)
 
 
 def _expand_adhesive_patch_indices(
@@ -851,76 +804,22 @@ def _expand_adhesive_patch_indices(
     expanded_patch_max_particles: int,
     eligible_indices,
 ):
-    if seed_indices.numel() == 0:
-        return seed_indices
-
-    local_positions = (
-        particle_positions - anchor_frame["origin"]
-    ) @ anchor_frame["rotation"]
-    seed_local_positions = local_positions[seed_indices]
-    tangent_center = torch.mean(seed_local_positions[:, :2], dim=0)
-    tangent_distance = torch.linalg.norm(
-        local_positions[:, :2] - tangent_center,
-        dim=1,
+    return cloth_utils.expand_adhesive_patch_indices(
+        particle_positions,
+        seed_indices,
+        anchor_frame,
+        expanded_patch_radius,
+        expanded_patch_max_particles,
+        eligible_indices,
     )
-    eligible_mask = torch.zeros(
-        particle_positions.shape[0],
-        dtype=torch.bool,
-        device=particle_positions.device,
-    )
-    eligible_mask[eligible_indices] = True
-    expanded_mask = (
-        tangent_distance <= float(expanded_patch_radius)
-    ) & eligible_mask
-    expanded_indices = torch.nonzero(expanded_mask, as_tuple=False).flatten()
-    if expanded_indices.numel() <= seed_indices.numel():
-        return seed_indices
-
-    if expanded_indices.numel() > int(expanded_patch_max_particles):
-        order = torch.argsort(tangent_distance[expanded_indices])[
-            :int(expanded_patch_max_particles)
-        ]
-        expanded_indices = expanded_indices[order]
-    return torch.unique(torch.cat((seed_indices, expanded_indices)))
 
 
 def _connected_component_indices_grid(mask, max_components: int):
-    if torch.count_nonzero(mask).item() == 0:
-        return []
-    if mask.numel() != TOY_CLOTH_PARTICLE_COUNT:
-        return [torch.nonzero(mask, as_tuple=False).flatten()]
-
-    rows = TOY_CLOTH_GRID_ROWS
-    columns = TOY_CLOTH_GRID_COLUMNS
-    inactive_label = mask.numel()
-    active_grid = mask.reshape(rows, columns)
-    labels = torch.arange(mask.numel(), dtype=torch.long, device=mask.device).reshape(
-        rows,
-        columns,
+    return cloth_utils.connected_component_indices_grid(
+        mask,
+        max_components,
+        (TOY_CLOTH_GRID_ROWS, TOY_CLOTH_GRID_COLUMNS),
     )
-    inactive_labels = torch.full_like(labels, inactive_label)
-    labels = torch.where(active_grid, labels, inactive_labels)
-    for _iteration in range(rows + columns):
-        next_labels = labels.clone()
-        next_labels[1:, :] = torch.minimum(next_labels[1:, :], labels[:-1, :])
-        next_labels[:-1, :] = torch.minimum(next_labels[:-1, :], labels[1:, :])
-        next_labels[:, 1:] = torch.minimum(next_labels[:, 1:], labels[:, :-1])
-        next_labels[:, :-1] = torch.minimum(next_labels[:, :-1], labels[:, 1:])
-        labels = torch.where(active_grid, next_labels, inactive_labels)
-
-    flat_labels = labels.flatten()
-    active_labels = flat_labels[mask]
-    component_labels, component_counts = torch.unique(
-        active_labels,
-        sorted=False,
-        return_counts=True,
-    )
-    count_order = torch.argsort(component_counts, descending=True)
-    retained_labels = component_labels[count_order[:max_components]]
-    return [
-        torch.nonzero(flat_labels == component_label, as_tuple=False).flatten()
-        for component_label in retained_labels
-    ]
 
 
 def _make_adhesive_patch(
@@ -936,73 +835,19 @@ def _make_adhesive_patch(
     adhesive_expanded_patch_max_particles: int,
     required_anchor_name: str | None = None,
 ):
-    if candidate_indices.numel() == 0:
-        return None
-    anchor = _choose_adhesive_anchor(
+    return cloth_utils.make_adhesive_patch(
         first_surface,
         second_surface,
+        particle_positions,
         candidate_indices,
+        pair_score,
+        expand_adhesive_patch=expand_adhesive_patch,
+        adhesive_patch_max_particles=adhesive_patch_max_particles,
+        adhesive_local_patch_radius=adhesive_local_patch_radius,
+        adhesive_expanded_patch_radius=adhesive_expanded_patch_radius,
+        adhesive_expanded_patch_max_particles=adhesive_expanded_patch_max_particles,
+        required_anchor_name=required_anchor_name,
     )
-    if required_anchor_name is not None:
-        surfaces_by_name = {
-            first_surface["name"]: first_surface,
-            second_surface["name"]: second_surface,
-        }
-        anchor = surfaces_by_name.get(required_anchor_name)
-        if anchor is None:
-            return None
-    anchor_frame = anchor["torch_frame"]
-    component_pair_score = pair_score[candidate_indices]
-    candidate_local_positions = (
-        particle_positions[candidate_indices] - anchor_frame["origin"]
-    ) @ anchor_frame["rotation"]
-    if adhesive_local_patch_radius > 0.0:
-        best_pair_order = torch.argsort(component_pair_score)
-        best_local_position = candidate_local_positions[best_pair_order[0]]
-        local_distances = torch.linalg.norm(
-            candidate_local_positions[:, :2] - best_local_position[:2],
-            dim=1,
-        )
-        local_mask = local_distances <= adhesive_local_patch_radius
-        local_candidate_indices = candidate_indices[local_mask]
-        local_pair_score = component_pair_score[local_mask]
-    else:
-        local_candidate_indices = candidate_indices
-        local_pair_score = component_pair_score
-    if local_candidate_indices.numel() == 0:
-        return None
-    local_order = torch.argsort(local_pair_score)[:adhesive_patch_max_particles]
-    seed_indices = local_candidate_indices[local_order]
-    selected_indices = (
-        _expand_adhesive_patch_indices(
-            particle_positions,
-            seed_indices,
-            anchor_frame,
-            adhesive_expanded_patch_radius,
-            adhesive_expanded_patch_max_particles,
-            candidate_indices,
-        )
-        if expand_adhesive_patch
-        else seed_indices
-    )
-    local_positions = (
-        particle_positions[selected_indices] - anchor_frame["origin"]
-    ) @ anchor_frame["rotation"]
-    required_side = (
-        first_surface.get("requires_closed_side")
-        or second_surface.get("requires_closed_side")
-    )
-    return {
-        "mode": f"{first_surface['name']}+{second_surface['name']}",
-        "anchor_name": anchor["name"],
-        "anchor_kind": anchor["kind"],
-        "indices": selected_indices,
-        "local_positions": local_positions,
-        "requires_closed_side": required_side,
-        "score": torch.mean(local_pair_score[local_order]),
-        "seed_count": int(seed_indices.numel()),
-        "candidate_count": int(candidate_indices.numel()),
-    }
 
 
 def _choose_adhesive_patches_torch(
@@ -1019,87 +864,23 @@ def _choose_adhesive_patches_torch(
     required_anchor_name: str | None = None,
     excluded_indices=None,
 ):
-    import torch
-
-    contacts = _surface_contacts_torch(active_surfaces, particle_positions)
-    excluded_mask = torch.zeros(
-        particle_positions.shape[0],
-        dtype=torch.bool,
-        device=particle_positions.device,
+    return cloth_utils.choose_adhesive_patches_torch(
+        active_surfaces,
+        particle_positions,
+        expand_adhesive_patch=expand_adhesive_patch,
+        adhesive_pair_mode=adhesive_pair_mode,
+        adhesive_patch_max_particles=adhesive_patch_max_particles,
+        adhesive_local_patch_radius=adhesive_local_patch_radius,
+        adhesive_expanded_patch_radius=adhesive_expanded_patch_radius,
+        adhesive_expanded_patch_max_particles=adhesive_expanded_patch_max_particles,
+        adhesive_max_patches=adhesive_max_patches,
+        adhesive_components_per_pair=adhesive_components_per_pair,
+        press_gap=ADHESIVE_PRESS_GAP,
+        signed_normal_slop=ADHESIVE_SIGNED_NORMAL_SLOP,
+        grid_shape=(TOY_CLOTH_GRID_ROWS, TOY_CLOTH_GRID_COLUMNS),
+        required_anchor_name=required_anchor_name,
+        excluded_indices=excluded_indices,
     )
-    if excluded_indices is not None and excluded_indices.numel() > 0:
-        excluded_mask[excluded_indices] = True
-    patches = []
-    for first_index, first_surface in enumerate(contacts):
-        for second_surface in contacts[first_index + 1:]:
-            if first_surface["kind"] != "finger" and second_surface["kind"] != "finger":
-                continue
-            if adhesive_pair_mode == "finger-pinch":
-                surface_names = {first_surface["name"], second_surface["name"]}
-                if surface_names != {"left_inner_face", "right_inner_face"}:
-                    continue
-            if first_surface["prim_path"] == second_surface["prim_path"]:
-                continue
-            first_pair_group = first_surface.get("pair_group")
-            second_pair_group = second_surface.get("pair_group")
-            if first_pair_group is not None and first_pair_group == second_pair_group:
-                continue
-            if not _surfaces_are_opposed(
-                first_surface,
-                second_surface,
-                particle_positions,
-            ):
-                continue
-            required_side = (
-                first_surface.get("requires_closed_side")
-                or second_surface.get("requires_closed_side")
-            )
-            if first_surface.get("requires_closed_side") not in (None, "pinch"):
-                continue
-            if second_surface.get("requires_closed_side") not in (None, "pinch"):
-                continue
-            combined_mask = (
-                first_surface["contact"]["mask"]
-                & second_surface["contact"]["mask"]
-                & _pressed_between_surfaces_torch(
-                    first_surface["contact"],
-                    second_surface["contact"],
-                )
-                & ~excluded_mask
-            )
-            pair_score = (
-                first_surface["contact"]["score"]
-                + second_surface["contact"]["score"]
-            )
-            component_indices = _connected_component_indices_grid(
-                combined_mask,
-                adhesive_components_per_pair,
-            )
-            for candidate_indices in component_indices:
-                patch = _make_adhesive_patch(
-                    first_surface,
-                    second_surface,
-                    particle_positions,
-                    candidate_indices,
-                    pair_score,
-                    expand_adhesive_patch,
-                    adhesive_patch_max_particles,
-                    adhesive_local_patch_radius,
-                    adhesive_expanded_patch_radius,
-                    adhesive_expanded_patch_max_particles,
-                    required_anchor_name,
-                )
-                if patch is not None:
-                    patches.append(patch)
-    patches.sort(
-        key=lambda patch: (
-            -int(patch["indices"].numel()),
-            float(patch["score"].item()),
-            patch["mode"],
-            patch["anchor_name"],
-        )
-    )
-    return patches[:adhesive_max_patches]
 
 
 def _choose_adhesive_patch_torch(
@@ -1114,21 +895,21 @@ def _choose_adhesive_patch_torch(
     required_anchor_name: str | None = None,
     excluded_indices=None,
 ):
-    patches = _choose_adhesive_patches_torch(
+    return cloth_utils.choose_adhesive_patch_torch(
         active_surfaces,
         particle_positions,
-        expand_adhesive_patch,
-        adhesive_pair_mode,
-        adhesive_patch_max_particles,
-        adhesive_local_patch_radius,
-        adhesive_expanded_patch_radius,
-        adhesive_expanded_patch_max_particles,
-        1,
-        1,
-        required_anchor_name,
-        excluded_indices,
+        expand_adhesive_patch=expand_adhesive_patch,
+        adhesive_pair_mode=adhesive_pair_mode,
+        adhesive_patch_max_particles=adhesive_patch_max_particles,
+        adhesive_local_patch_radius=adhesive_local_patch_radius,
+        adhesive_expanded_patch_radius=adhesive_expanded_patch_radius,
+        adhesive_expanded_patch_max_particles=adhesive_expanded_patch_max_particles,
+        press_gap=ADHESIVE_PRESS_GAP,
+        signed_normal_slop=ADHESIVE_SIGNED_NORMAL_SLOP,
+        grid_shape=(TOY_CLOTH_GRID_ROWS, TOY_CLOTH_GRID_COLUMNS),
+        required_anchor_name=required_anchor_name,
+        excluded_indices=excluded_indices,
     )
-    return patches[0] if patches else None
 
 
 def _choose_two_anchor_patches(
@@ -1236,238 +1017,43 @@ def _project_attached_patches(
     sticking_pd_kd: float,
     sticking_pd_max_speed: float,
 ):
-    position_targets = positions.clone()
-    velocity_targets = velocities.clone() * float(nonanchor_velocity_damping)
-    metrics = []
-    for patch in patches:
-        anchor_surface = surfaces_by_name[patch["anchor_name"]]
-        anchor_frame = _surface_frame_tensors(anchor_surface, particle_positions)
-        target_positions = (
-            patch["local_positions"] @ anchor_frame["rotation"].T
-        ) + anchor_frame["origin"]
-        selected_indices = patch["indices"]
-        previous_target_positions = patch.get("previous_target_positions")
-        if attached_velocity_mode == "zero":
-            anchor_velocities = torch.zeros_like(target_positions)
-        elif (
-            previous_target_positions is not None
-            and previous_target_positions.shape == target_positions.shape
-        ):
-            anchor_velocities = (
-                target_positions - previous_target_positions
-            ) / float(physics_dt)
-        else:
-            anchor_velocities = torch.zeros_like(target_positions)
-        if sticking_drive_mode == "teleport":
-            position_targets[0, selected_indices] = target_positions
-            velocity_targets[0, selected_indices] = anchor_velocities
-            metrics.append(
-                {
-                    "mode": patch["mode"],
-                    "anchor_name": patch["anchor_name"],
-                    "particles": int(selected_indices.numel()),
-                }
-            )
-        else:
-            selected_positions = particle_positions[selected_indices]
-            selected_velocities = velocities[0, selected_indices]
-            position_errors = target_positions - selected_positions
-            velocity_errors = anchor_velocities - selected_velocities
-            position_response = min(
-                max(float(sticking_pd_kp) * float(physics_dt), 0.0),
-                1.0,
-            )
-            velocity_response = min(
-                max(float(sticking_pd_kd) * float(physics_dt), 0.0),
-                1.0,
-            )
-            raw_corrections = position_response * position_errors
-            correction_speed = torch.linalg.norm(
-                raw_corrections,
-                dim=1,
-                keepdim=True,
-            ) / float(physics_dt)
-            speed_scale = torch.clamp(
-                float(sticking_pd_max_speed)
-                / torch.clamp(correction_speed, min=1e-6),
-                max=1.0,
-            )
-            position_corrections = raw_corrections * speed_scale
-            next_positions = selected_positions + position_corrections
-            correction_velocities = position_corrections / float(physics_dt)
-            damping_velocities = velocity_response * velocity_errors
-            next_velocities = (
-                anchor_velocities
-                + correction_velocities
-                + damping_velocities
-            )
-            next_speed = torch.linalg.norm(next_velocities, dim=1, keepdim=True)
-            next_speed_scale = torch.clamp(
-                float(sticking_pd_max_speed)
-                / torch.clamp(next_speed, min=1e-6),
-                max=1.0,
-            )
-            position_targets[0, selected_indices] = next_positions
-            velocity_targets[0, selected_indices] = next_velocities * next_speed_scale
-            metrics.append(
-                {
-                    "mode": patch["mode"],
-                    "anchor_name": patch["anchor_name"],
-                    "particles": int(selected_indices.numel()),
-                    "position_error_mean_m": float(
-                        torch.mean(torch.linalg.norm(position_errors, dim=1)).item()
-                    ),
-                    "position_error_max_m": float(
-                        torch.max(torch.linalg.norm(position_errors, dim=1)).item()
-                    ),
-                    "correction_speed_mean_mps": float(
-                        torch.mean(correction_speed).item()
-                    ),
-                    "correction_speed_max_mps": float(
-                        torch.max(correction_speed).item()
-                    ),
-                    "velocity_mean_mps": float(torch.mean(next_speed).item()),
-                    "velocity_max_mps": float(torch.max(next_speed).item()),
-                    "speed_limited_particles": int(
-                        torch.count_nonzero(next_speed_scale[:, 0] < 0.999).item()
-                    ),
-                }
-            )
-        patch["previous_target_positions"] = target_positions.detach().clone()
-    _project_fold_pairs(position_targets, velocity_targets, fold_pairs, physics_dt)
-    cloth_view.set_world_positions(position_targets)
-    cloth_view.set_velocities(velocity_targets)
-    return metrics
+    def project_fold_pairs(position_targets, velocity_targets):
+        _project_fold_pairs(position_targets, velocity_targets, fold_pairs, physics_dt)
+
+    return cloth_utils.project_attached_patches(
+        cloth_view,
+        positions,
+        velocities,
+        particle_positions,
+        surfaces_by_name,
+        patches,
+        physics_dt=physics_dt,
+        nonanchor_velocity_damping=nonanchor_velocity_damping,
+        attached_velocity_mode=attached_velocity_mode,
+        sticking_drive_mode=sticking_drive_mode,
+        sticking_pd_kp=sticking_pd_kp,
+        sticking_pd_kd=sticking_pd_kd,
+        sticking_pd_max_speed=sticking_pd_max_speed,
+        fold_pair_projector=project_fold_pairs,
+    )
 
 
 def _attached_patch_summaries(patches, particle_positions):
-    summaries = []
-    for patch in patches:
-        patch_positions = particle_positions[patch["indices"]]
-        patch_span = (
-            torch.max(patch_positions, dim=0).values
-            - torch.min(patch_positions, dim=0).values
-        )
-        summaries.append(
-            {
-                "mode": patch["mode"],
-                "anchor_name": patch["anchor_name"],
-                "particles": int(patch["indices"].numel()),
-                "seed_count": patch.get("seed_count"),
-                "candidate_count": patch.get("candidate_count"),
-                "span_m": [float(value.item()) for value in patch_span],
-            }
-        )
-    return summaries
+    return cloth_utils.attached_patch_summaries(patches, particle_positions)
 
 
 def _surface_selected_contact_diagnostic(surface, selected_indices):
-    contact = surface["contact"]
-    local_positions = contact["local_positions"][selected_indices]
-    half_extents = surface.get("half_extents")
-    normal_mask = (
-        contact["normal_distance"][selected_indices]
-        <= float(surface["contact_margin"])
-    )
-    if half_extents is None:
-        tangent_mask = (
-            contact["tangent_distance"][selected_indices]
-            <= float(surface["radius"])
-        )
-    else:
-        tangent_mask = (
-            (torch.abs(local_positions[:, 0]) <= float(half_extents[0]))
-            & (torch.abs(local_positions[:, 1]) <= float(half_extents[1]))
-        )
-    return {
-        "name": surface["name"],
-        "mask_count": int(
-            torch.count_nonzero(contact["mask"][selected_indices]).item()
-        ),
-        "normal_count": int(torch.count_nonzero(normal_mask).item()),
-        "tangent_count": int(torch.count_nonzero(tangent_mask).item()),
-        "normal_abs_max_m": float(
-            torch.max(contact["normal_distance"][selected_indices]).item()
-        ),
-        "signed_normal_min_m": float(
-            torch.min(contact["signed_normal_distance"][selected_indices]).item()
-        ),
-        "signed_normal_max_m": float(
-            torch.max(contact["signed_normal_distance"][selected_indices]).item()
-        ),
-        "tangent_abs_max_m": [
-            float(torch.max(torch.abs(local_positions[:, axis])).item())
-            for axis in range(2)
-        ],
-        "local_min_m": [
-            float(value.item())
-            for value in torch.min(local_positions, dim=0).values
-        ],
-        "local_max_m": [
-            float(value.item())
-            for value in torch.max(local_positions, dim=0).values
-        ],
-        "half_extents_m": list(half_extents) if half_extents is not None else None,
-        "contact_margin_m": float(surface["contact_margin"]),
-    }
+    return cloth_utils.surface_selected_contact_diagnostic(surface, selected_indices)
 
 
 def _active_patch_contact_diagnostics(active_surfaces, particle_positions, patches):
-    if not patches:
-        return []
-    contacts_by_name = {
-        surface["name"]: surface
-        for surface in _surface_contacts_torch(active_surfaces, particle_positions)
-    }
-    diagnostics = []
-    for patch in patches:
-        selected_indices = patch["indices"]
-        surface_names = patch["mode"].split("+")
-        patch_contacts = [
-            contacts_by_name[name]
-            for name in surface_names
-            if name in contacts_by_name
-        ]
-        if len(patch_contacts) != 2 or selected_indices.numel() == 0:
-            diagnostics.append(
-                {
-                    "mode": patch["mode"],
-                    "anchor_name": patch["anchor_name"],
-                    "particles": int(selected_indices.numel()),
-                    "pressed_count": 0,
-                    "surfaces": [],
-                }
-            )
-            continue
-        first_contact = patch_contacts[0]["contact"]
-        second_contact = patch_contacts[1]["contact"]
-        pair_pressed_mask = (
-            first_contact["mask"]
-            & second_contact["mask"]
-            & _pressed_between_surfaces_torch(first_contact, second_contact)
-        )
-        selected_pressed = pair_pressed_mask[selected_indices]
-        surface_gap = torch.linalg.norm(
-            first_contact["closest_points"][selected_indices]
-            - second_contact["closest_points"][selected_indices],
-            dim=1,
-        )
-        diagnostics.append(
-            {
-                "mode": patch["mode"],
-                "anchor_name": patch["anchor_name"],
-                "particles": int(selected_indices.numel()),
-                "pressed_count": int(torch.count_nonzero(selected_pressed).item()),
-                "surface_gap_min_m": float(torch.min(surface_gap).item()),
-                "surface_gap_max_m": float(torch.max(surface_gap).item()),
-                "press_gap_m": float(ADHESIVE_PRESS_GAP),
-                "surfaces": [
-                    _surface_selected_contact_diagnostic(surface, selected_indices)
-                    for surface in patch_contacts
-                ],
-            }
-        )
-    return diagnostics
+    return cloth_utils.active_patch_contact_diagnostics(
+        active_surfaces,
+        particle_positions,
+        patches,
+        press_gap=ADHESIVE_PRESS_GAP,
+        signed_normal_slop=ADHESIVE_SIGNED_NORMAL_SLOP,
+    )
 
 
 def _clamp_inner_patch_targets_to_gap(patches):
@@ -1677,49 +1263,20 @@ def _choose_current_adhesive_patches(
 
 
 def _patch_contact_keys(patches):
-    return sorted(
-        (patch["mode"], patch["anchor_name"])
-        for patch in patches
-    )
+    return cloth_utils.patch_contact_keys(patches)
 
 
 def _copy_patch_velocity_history(candidate_patches, active_patches):
-    for candidate_patch in candidate_patches:
-        active_patch = next(
-            (
-                patch
-                for patch in active_patches
-                if patch["mode"] == candidate_patch["mode"]
-                and patch["anchor_name"] == candidate_patch["anchor_name"]
-                and torch.equal(patch["indices"], candidate_patch["indices"])
-            ),
-            None,
-        )
-        if active_patch is None:
-            continue
-        previous_targets = active_patch.get("previous_target_positions")
-        if previous_targets is not None:
-            candidate_patch["previous_target_positions"] = previous_targets
+    cloth_utils.copy_patch_velocity_history(candidate_patches, active_patches)
 
 
 def _patch_current_pressed_mask(patch, contacts_by_name):
-    surface_names = patch["mode"].split("+")
-    if len(surface_names) != 2:
-        return None
-    first_surface = contacts_by_name.get(surface_names[0])
-    second_surface = contacts_by_name.get(surface_names[1])
-    if first_surface is None or second_surface is None:
-        return None
-    selected_indices = patch["indices"]
-    pair_pressed_mask = (
-        first_surface["contact"]["mask"]
-        & second_surface["contact"]["mask"]
-        & _pressed_between_surfaces_torch(
-            first_surface["contact"],
-            second_surface["contact"],
-        )
+    return cloth_utils.patch_current_pressed_mask(
+        patch,
+        contacts_by_name,
+        press_gap=ADHESIVE_PRESS_GAP,
+        signed_normal_slop=ADHESIVE_SIGNED_NORMAL_SLOP,
     )
-    return pair_pressed_mask[selected_indices]
 
 
 def _filter_active_patches_by_current_contact(
@@ -1727,38 +1284,13 @@ def _filter_active_patches_by_current_contact(
     particle_positions,
     active_patches,
 ):
-    contacts_by_name = {
-        surface["name"]: surface
-        for surface in _surface_contacts_torch(active_surfaces, particle_positions)
-    }
-    valid_patches = []
-    release_events = []
-    for patch in active_patches:
-        pressed_mask = _patch_current_pressed_mask(patch, contacts_by_name)
-        if pressed_mask is None:
-            release_events.append((patch, 0, int(patch["indices"].numel())))
-            continue
-        pressed_count = int(torch.count_nonzero(pressed_mask).item())
-        original_count = int(patch["indices"].numel())
-        if pressed_count == 0:
-            release_events.append((patch, pressed_count, original_count))
-            continue
-        if pressed_count == original_count:
-            valid_patches.append(patch)
-            continue
-
-        pruned_patch = {
-            **patch,
-            "indices": patch["indices"][pressed_mask],
-            "local_positions": patch["local_positions"][pressed_mask],
-            "candidate_count": pressed_count,
-        }
-        previous_targets = patch.get("previous_target_positions")
-        if previous_targets is not None and previous_targets.shape[0] == original_count:
-            pruned_patch["previous_target_positions"] = previous_targets[pressed_mask]
-        valid_patches.append(pruned_patch)
-        release_events.append((patch, pressed_count, original_count))
-    return valid_patches, release_events
+    return cloth_utils.filter_active_patches_by_current_contact(
+        active_surfaces,
+        particle_positions,
+        active_patches,
+        press_gap=ADHESIVE_PRESS_GAP,
+        signed_normal_slop=ADHESIVE_SIGNED_NORMAL_SLOP,
+    )
 
 
 def _new_contact_patches(
@@ -2270,8 +1802,9 @@ def _compose_video(frame_dir: Path, video_path: Path, fps: int):
 
 def main():
     args = _parse_args()
-    global ADHESIVE_PRESS_GAP
+    global ADHESIVE_PRESS_GAP, TOY_STICKING_DEBUG
     ADHESIVE_PRESS_GAP = args.adhesive_press_gap
+    TOY_STICKING_DEBUG = args.sticking_debug
     args.output_root.mkdir(parents=True, exist_ok=True)
     result_json = args.result_json or args.output_root / "result.json"
 

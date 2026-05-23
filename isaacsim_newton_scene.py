@@ -35,6 +35,8 @@ from pathlib import Path
 
 import numpy as np
 
+import cloth_utils
+
 
 ROOT_DIR = Path(__file__).resolve().parent
 ROBOT_URDF_PATH = ROOT_DIR / "piper_x_description_dualarm.urdf"
@@ -1773,168 +1775,50 @@ def _surface_frame(stage, surface):
 
 
 def _surface_frame_tensors(surface, particle_positions):
-    import torch
-
-    device = particle_positions.device
-    dtype = particle_positions.dtype
-    frame = surface["frame"]
-    return {
-        "origin": torch.as_tensor(frame["origin"], dtype=dtype, device=device),
-        "rotation": torch.as_tensor(frame["rotation"], dtype=dtype, device=device),
-    }
+    return cloth_utils.surface_frame_tensors(surface, particle_positions)
 
 
 def _surface_contact_torch(surface, particle_positions):
-    import torch
-
-    frame = _surface_frame_tensors(surface, particle_positions)
-    local_positions = (particle_positions - frame["origin"]) @ frame["rotation"]
-    tangent_distance = torch.linalg.norm(local_positions[:, :2], dim=1)
-    normal_distance = torch.abs(local_positions[:, 2])
-    closest_points = (
-        particle_positions
-        - frame["rotation"][:, 2] * local_positions[:, 2:3]
-    )
-    mask = (
-        (normal_distance <= float(surface["contact_margin"]))
-        & (tangent_distance <= float(surface["radius"]))
-    )
-    score = normal_distance + 0.25 * tangent_distance
-    return {
-        "frame": frame,
-        "local_positions": local_positions,
-        "tangent_distance": tangent_distance,
-        "normal_distance": normal_distance,
-        "closest_points": closest_points,
-        "mask": mask,
-        "score": score,
-    }
+    return cloth_utils.surface_contact_torch(surface, particle_positions)
 
 
 def _surface_contacts_torch(active_surfaces, particle_positions):
-    return [
-        {
-            **surface,
-            "torch_frame": _surface_frame_tensors(surface, particle_positions),
-            "contact": _surface_contact_torch(surface, particle_positions),
-        }
-        for surface in active_surfaces
-    ]
+    return cloth_utils.surface_contacts_torch(active_surfaces, particle_positions)
 
 
 def _pressed_between_surfaces_torch(first_contact, second_contact):
-    import torch
-
-    # The cloth API used here exposes positions but not per-particle contact
-    # impulse. Approximate pressure by requiring the nearest points on the two
-    # contact surfaces around each particle to nearly coincide.
-    surface_gap = torch.linalg.norm(
-        first_contact["closest_points"] - second_contact["closest_points"],
-        dim=1,
+    return cloth_utils.pressed_between_surfaces_torch(
+        first_contact,
+        second_contact,
+        ADHESIVE_PRESS_GAP,
     )
-    return surface_gap <= ADHESIVE_PRESS_GAP
 
 
 def _adhesive_surfaces_are_opposed(first_surface, second_surface):
-    import torch
-
-    first_normal = first_surface["torch_frame"]["rotation"][:, 2]
-    second_normal = second_surface["torch_frame"]["rotation"][:, 2]
-    return bool(torch.dot(first_normal, second_normal).item() < -0.35)
+    return cloth_utils.surfaces_are_opposed(first_surface, second_surface)
 
 
 def _adhesive_surfaces_can_pair(first_surface, second_surface, side):
-    if first_surface["kind"] != "finger" and second_surface["kind"] != "finger":
-        return False
-    if first_surface["prim_path"] == second_surface["prim_path"]:
-        return False
-    first_pair_group = first_surface.get("pair_group")
-    second_pair_group = second_surface.get("pair_group")
-    if first_pair_group is not None and first_pair_group == second_pair_group:
-        return False
-    if not _adhesive_surfaces_are_opposed(first_surface, second_surface):
-        return False
-    if first_surface.get("requires_closed_side") not in (None, side):
-        return False
-    if second_surface.get("requires_closed_side") not in (None, side):
-        return False
-    return True
+    return cloth_utils.adhesive_surfaces_can_pair(first_surface, second_surface, side)
 
 
 def _adhesive_pair_stats(first_surface, second_surface):
-    import torch
-
-    contact_mask = first_surface["contact"]["mask"] & second_surface["contact"]["mask"]
-    contact_count = int(torch.count_nonzero(contact_mask).item())
-    pair_score = first_surface["contact"]["score"] + second_surface["contact"]["score"]
-    min_pair_score = float(torch.min(pair_score).item())
-    if contact_count == 0:
-        return {
-            "contact_count": 0,
-            "pressed_count": 0,
-            "min_gap": None,
-            "min_pair_score": min_pair_score,
-            "first_min_normal": float(
-                torch.min(first_surface["contact"]["normal_distance"]).item()
-            ),
-            "second_min_normal": float(
-                torch.min(second_surface["contact"]["normal_distance"]).item()
-            ),
-            "first_min_tangent": float(
-                torch.min(first_surface["contact"]["tangent_distance"]).item()
-            ),
-            "second_min_tangent": float(
-                torch.min(second_surface["contact"]["tangent_distance"]).item()
-            ),
-            "first_radius": float(first_surface["radius"]),
-            "second_radius": float(second_surface["radius"]),
-        }
-    surface_gap = torch.linalg.norm(
-        first_surface["contact"]["closest_points"]
-        - second_surface["contact"]["closest_points"],
-        dim=1,
+    return cloth_utils.adhesive_pair_stats(
+        first_surface,
+        second_surface,
+        ADHESIVE_PRESS_GAP,
     )
-    pressed_count = int(
-        torch.count_nonzero(contact_mask & (surface_gap <= ADHESIVE_PRESS_GAP)).item()
-    )
-    return {
-        "contact_count": contact_count,
-        "pressed_count": pressed_count,
-        "min_gap": float(torch.min(surface_gap[contact_mask]).item()),
-        "min_pair_score": min_pair_score,
-        "first_min_normal": float(
-            torch.min(first_surface["contact"]["normal_distance"]).item()
-        ),
-        "second_min_normal": float(
-            torch.min(second_surface["contact"]["normal_distance"]).item()
-        ),
-        "first_min_tangent": float(
-            torch.min(first_surface["contact"]["tangent_distance"]).item()
-        ),
-        "second_min_tangent": float(
-            torch.min(second_surface["contact"]["tangent_distance"]).item()
-        ),
-        "first_radius": float(first_surface["radius"]),
-        "second_radius": float(second_surface["radius"]),
-    }
 
 
 def _surface_candidate_distance(surface, candidate_indices):
-    if candidate_indices is None or candidate_indices.numel() == 0:
-        return float("inf")
-    return float(
-        surface["contact"]["normal_distance"][candidate_indices].mean().item()
-    )
+    return cloth_utils.surface_candidate_distance(surface, candidate_indices)
 
 
 def _choose_adhesive_anchor(first_surface, second_surface, candidate_indices):
-    return max(
-        (first_surface, second_surface),
-        key=lambda surface: (
-            surface.get("adhesion", 0.0),
-            surface.get("friction", 0.0),
-            -_surface_candidate_distance(surface, candidate_indices),
-        ),
+    return cloth_utils.choose_adhesive_anchor(
+        first_surface,
+        second_surface,
+        candidate_indices,
     )
 
 
