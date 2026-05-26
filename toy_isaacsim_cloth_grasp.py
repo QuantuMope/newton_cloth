@@ -76,6 +76,8 @@ TOY_CLOTH_REST_OFFSET = 0.003
 TOY_CLOTH_CONTACT_OFFSET = 0.003
 ADHESIVE_SIGNED_NORMAL_SLOP = TOY_CLOTH_CONTACT_OFFSET
 TOY_GRIPPER_PHYSICS_FRICTION = (0.1, 0.08)
+TOY_TABLE_SLIDE_DISTANCE = 0.080
+TOY_TABLE_SLIDE_FINGER_Z = FINGER_PRESS_Z - 0.002
 TOY_CLOTH_TOTAL_MASS = 0.050
 TOY_CLOTH_GRID_COLUMNS = 49 + 1
 TOY_CLOTH_GRID_ROWS = 33 + 1
@@ -137,6 +139,12 @@ def _parse_args():
         default=15,
         help="Step interval for result JSON diagnostic snapshots.",
     )
+    parser.add_argument(
+        "--demo-mode",
+        choices=("grasp", "table-slide"),
+        default="grasp",
+        help="Scripted toy action sequence to run.",
+    )
     parser.add_argument("--steps", type=int, default=476)
     parser.add_argument(
         "--start-closed",
@@ -166,6 +174,20 @@ def _parse_args():
         help="Hold closed fingers still before lifting so the fold can settle.",
     )
     parser.add_argument("--lift-steps", type=int, default=180)
+    parser.add_argument("--slide-steps", type=int, default=120)
+    parser.add_argument("--slide-hold-steps", type=int, default=30)
+    parser.add_argument(
+        "--slide-distance",
+        type=float,
+        default=TOY_TABLE_SLIDE_DISTANCE,
+        help="World-X distance for the table-slide demo.",
+    )
+    parser.add_argument(
+        "--slide-finger-z",
+        type=float,
+        default=TOY_TABLE_SLIDE_FINGER_Z,
+        help="Pressed finger center z for the table-slide demo.",
+    )
     parser.add_argument(
         "--finger-lift-z",
         type=float,
@@ -275,8 +297,11 @@ def _parse_args():
     parser.add_argument(
         "--sticking-drive-mode",
         choices=("teleport", "pd"),
-        default="teleport",
-        help="Drive adhesive particles by position projection or by PD velocity updates.",
+        default=None,
+        help=(
+            "Drive adhesive particles by position projection or by PD velocity "
+            "updates. Defaults to teleport."
+        ),
     )
     parser.add_argument(
         "--sticking-update-phase",
@@ -1197,6 +1222,19 @@ def _attachment_centroid_diagnostics(patches, particle_positions):
     return diagnostics
 
 
+def _cloth_shape_diagnostics(particle_positions):
+    centroid = torch.mean(particle_positions, dim=0)
+    minimum = torch.min(particle_positions, dim=0).values
+    maximum = torch.max(particle_positions, dim=0).values
+    span = maximum - minimum
+    return {
+        "cloth_centroid_m": [float(value.item()) for value in centroid],
+        "cloth_min_m": [float(value.item()) for value in minimum],
+        "cloth_max_m": [float(value.item()) for value in maximum],
+        "cloth_span_m": [float(value.item()) for value in span],
+    }
+
+
 def _surface_selected_contact_diagnostic(surface, selected_indices):
     return cloth_utils.surface_selected_contact_diagnostic(surface, selected_indices)
 
@@ -2030,6 +2068,131 @@ def _compose_video(frame_dir: Path, video_path: Path, fps: int):
     return video_path
 
 
+def _grasp_script_state(args, step: int) -> dict:
+    lower_amount = (
+        1.0
+        if args.start_closed
+        else (step - args.settle_steps) / max(args.lower_steps, 1)
+    )
+    close_amount = (
+        1.0
+        if args.start_closed
+        else (
+            step - args.settle_steps - args.lower_steps - args.preclose_lift_steps
+        ) / max(args.close_steps, 1)
+    )
+    lift_amount = (
+        step
+        - args.settle_steps
+        - args.lower_steps
+        - args.preclose_lift_steps
+        - args.close_steps
+        - args.pinch_settle_steps
+    ) / max(args.lift_steps, 1)
+    release_amount = (
+        step
+        - args.settle_steps
+        - args.lower_steps
+        - args.preclose_lift_steps
+        - args.close_steps
+        - args.pinch_settle_steps
+        - args.lift_steps
+    ) / max(args.release_steps, 1)
+    close_fraction = min(max(close_amount, 0.0), 1.0)
+    release_fraction = min(max(release_amount, 0.0), 1.0)
+    lower_fraction = min(max(lower_amount, 0.0), 1.0)
+    closed_finger_y_offset = _lerp(
+        FINGER_START_Y_OFFSET,
+        args.finger_closed_y_offset,
+        close_amount,
+    )
+    finger_y_offset = _lerp(
+        closed_finger_y_offset,
+        FINGER_START_Y_OFFSET,
+        release_fraction,
+    )
+    press_z = _lerp(FINGER_START_Z, FINGER_PRESS_Z, lower_amount)
+    if args.preclose_lift_steps > 0 and lower_fraction >= 1.0:
+        preclose_lift_amount = (
+            step - args.settle_steps - args.lower_steps
+        ) / max(args.preclose_lift_steps, 1)
+        close_z = _lerp(FINGER_PRESS_Z, FINGER_CLOSE_Z, preclose_lift_amount)
+    else:
+        close_z = FINGER_PRESS_Z if lower_fraction >= 1.0 else press_z
+    prelift_finger_z = close_z
+    lifted_finger_z = _lerp(prelift_finger_z, args.finger_lift_z, lift_amount)
+    finger_z = _lerp(lifted_finger_z, args.finger_lift_z, release_fraction)
+    pregrasp_active = (
+        args.table_press_pregrasp
+        and lower_fraction >= 1.0
+        and close_fraction < 1.0
+    )
+    allow_new_attachment = (
+        release_fraction <= 0.0
+        and (
+            pregrasp_active
+            or (not args.attach_when_closed)
+            or args.start_closed
+            or close_fraction >= 1.0
+        )
+    )
+    return {
+        "finger_x": FINGER_CENTER_X,
+        "finger_y_offset": finger_y_offset,
+        "finger_z": finger_z,
+        "lower_fraction": lower_fraction,
+        "close_fraction": close_fraction,
+        "release_fraction": release_fraction,
+        "allow_new_attachment": allow_new_attachment,
+        "upgrade_to_finger_pinch": (
+            args.upgrade_pregrasp_to_pinch and close_fraction > 0.0
+        ),
+        "handoff_to_inner_patches": (
+            args.handoff_pregrasp_to_inner_patches and close_fraction >= 0.85
+        ),
+        "fold_cloth_sticking": args.fold_cloth_sticking and close_fraction >= 1.0,
+    }
+
+
+def _table_slide_script_state(args, step: int) -> dict:
+    lower_amount = (step - args.settle_steps) / max(args.lower_steps, 1)
+    slide_amount = (
+        step - args.settle_steps - args.lower_steps
+    ) / max(args.slide_steps, 1)
+    release_amount = (
+        step
+        - args.settle_steps
+        - args.lower_steps
+        - args.slide_steps
+        - args.slide_hold_steps
+    ) / max(args.release_steps, 1)
+    lower_fraction = min(max(lower_amount, 0.0), 1.0)
+    slide_fraction = min(max(slide_amount, 0.0), 1.0)
+    release_fraction = min(max(release_amount, 0.0), 1.0)
+    return {
+        "finger_x": FINGER_CENTER_X + args.slide_distance * slide_fraction,
+        "finger_y_offset": FINGER_START_Y_OFFSET,
+        "finger_z": _lerp(FINGER_START_Z, args.slide_finger_z, lower_amount),
+        "lower_fraction": lower_fraction,
+        "close_fraction": 0.0,
+        "release_fraction": release_fraction,
+        "allow_new_attachment": (
+            args.table_press_pregrasp
+            and lower_fraction >= 1.0
+            and release_fraction <= 0.0
+        ),
+        "upgrade_to_finger_pinch": False,
+        "handoff_to_inner_patches": False,
+        "fold_cloth_sticking": False,
+    }
+
+
+def _script_state(args, step: int) -> dict:
+    if args.demo_mode == "table-slide":
+        return _table_slide_script_state(args, step)
+    return _grasp_script_state(args, step)
+
+
 def main():
     args = _parse_args()
     global ADHESIVE_PRESS_GAP, ADHESIVE_SIGNED_NORMAL_SLOP
@@ -2038,6 +2201,8 @@ def main():
     TOY_CLOTH_REST_OFFSET = args.cloth_rest_offset
     TOY_CLOTH_CONTACT_OFFSET = args.cloth_contact_offset
     ADHESIVE_SIGNED_NORMAL_SLOP = args.cloth_contact_offset
+    if args.sticking_drive_mode is None:
+        args.sticking_drive_mode = "teleport"
     TOY_STICKING_DEBUG = args.sticking_debug
     args.output_root.mkdir(parents=True, exist_ok=True)
     result_json = args.result_json or args.output_root / "result.json"
@@ -2130,99 +2295,34 @@ def main():
         attached_centroid_z = []
         diagnostic_snapshots = []
         initial_cloth_centroid_z = None
+        initial_cloth_centroid_m = None
+        initial_cloth_span_m = None
         max_cloth_centroid_z = None
+        max_cloth_span_z = None
+        final_positions = None
 
         for step in range(args.steps):
-            lower_amount = (
-                1.0
-                if args.start_closed
-                else (step - args.settle_steps) / max(args.lower_steps, 1)
-            )
-            close_amount = (
-                1.0
-                if args.start_closed
-                else (
-                    step
-                    - args.settle_steps
-                    - args.lower_steps
-                    - args.preclose_lift_steps
-                ) / max(args.close_steps, 1)
-            )
-            lift_amount = (
-                step
-                - args.settle_steps
-                - args.lower_steps
-                - args.preclose_lift_steps
-                - args.close_steps
-                - args.pinch_settle_steps
-            ) / max(args.lift_steps, 1)
-            release_amount = (
-                step
-                - args.settle_steps
-                - args.lower_steps
-                - args.preclose_lift_steps
-                - args.close_steps
-                - args.pinch_settle_steps
-                - args.lift_steps
-            ) / max(args.release_steps, 1)
-            close_fraction = min(max(close_amount, 0.0), 1.0)
-            release_fraction = min(max(release_amount, 0.0), 1.0)
-            lower_fraction = min(max(lower_amount, 0.0), 1.0)
-            pregrasp_active = (
-                args.table_press_pregrasp
-                and lower_fraction >= 1.0
-                and close_fraction < 1.0
-            )
-            allow_new_attachment = (
-                release_fraction <= 0.0
-                and (
-                    pregrasp_active
-                    or (not args.attach_when_closed)
-                    or args.start_closed
-                    or close_fraction >= 1.0
-                )
-            )
+            script_state = _script_state(args, step)
+            finger_x = script_state["finger_x"]
+            finger_y_offset = script_state["finger_y_offset"]
+            finger_z = script_state["finger_z"]
+            close_fraction = script_state["close_fraction"]
+            release_fraction = script_state["release_fraction"]
+            allow_new_attachment = script_state["allow_new_attachment"]
             adhesive_pair_mode = args.adhesive_pair_mode
-            upgrade_to_finger_pinch = (
-                args.upgrade_pregrasp_to_pinch
-                and close_fraction > 0.0
-            )
-            handoff_to_inner_patches = (
-                args.handoff_pregrasp_to_inner_patches
-                and close_fraction >= 0.85
-            )
+            upgrade_to_finger_pinch = script_state["upgrade_to_finger_pinch"]
+            handoff_to_inner_patches = script_state["handoff_to_inner_patches"]
             # Active patches are validated against the surface pair that created
             # them, so bottom/table pregrasp patches release when that contact
             # separates instead of being handed to inner-finger contact.
             release_stale_pregrasp = False
-            closed_finger_y_offset = _lerp(
-                FINGER_START_Y_OFFSET,
-                args.finger_closed_y_offset,
-                close_amount,
-            )
-            finger_y_offset = _lerp(
-                closed_finger_y_offset,
-                FINGER_START_Y_OFFSET,
-                release_fraction,
-            )
-            press_z = _lerp(FINGER_START_Z, FINGER_PRESS_Z, lower_amount)
-            if args.preclose_lift_steps > 0 and lower_fraction >= 1.0:
-                preclose_lift_amount = (
-                    step - args.settle_steps - args.lower_steps
-                ) / max(args.preclose_lift_steps, 1)
-                close_z = _lerp(FINGER_PRESS_Z, FINGER_CLOSE_Z, preclose_lift_amount)
-            else:
-                close_z = FINGER_PRESS_Z if lower_fraction >= 1.0 else press_z
-            prelift_finger_z = close_z
-            lifted_finger_z = _lerp(prelift_finger_z, args.finger_lift_z, lift_amount)
-            finger_z = _lerp(lifted_finger_z, args.finger_lift_z, release_fraction)
             _set_finger_pose(
                 left_finger,
-                (FINGER_CENTER_X, TABLE_CENTER[1] - finger_y_offset, finger_z),
+                (finger_x, TABLE_CENTER[1] - finger_y_offset, finger_z),
             )
             _set_finger_pose(
                 right_finger,
-                (FINGER_CENTER_X, TABLE_CENTER[1] + finger_y_offset, finger_z),
+                (finger_x, TABLE_CENTER[1] + finger_y_offset, finger_z),
             )
 
             log_state["step"] = step
@@ -2254,7 +2354,7 @@ def main():
                         upgrade_to_finger_pinch,
                         handoff_to_inner_patches,
                         release_stale_pregrasp,
-                        args.fold_cloth_sticking and close_fraction >= 1.0,
+                        script_state["fold_cloth_sticking"],
                         args.fold_cloth_max_pairs,
                         args.fold_cloth_pair_distance,
                         args.pregrasp_patch_count,
@@ -2282,11 +2382,19 @@ def main():
             _cloth_view, _positions, _velocities, particle_positions, _particle_velocities = (
                 _torch_cloth_state(cloth)
             )
+            final_positions = particle_positions.detach().clone()
+            cloth_shape = _cloth_shape_diagnostics(particle_positions)
             cloth_centroid_z = float(torch.mean(particle_positions[:, 2]).item())
+            cloth_span_z = cloth_shape["cloth_span_m"][2]
             max_cloth_centroid_z = (
                 cloth_centroid_z
                 if max_cloth_centroid_z is None
                 else max(max_cloth_centroid_z, cloth_centroid_z)
+            )
+            max_cloth_span_z = (
+                cloth_span_z
+                if max_cloth_span_z is None
+                else max(max_cloth_span_z, cloth_span_z)
             )
             diagnostic_interval = max(args.diagnostic_interval, 1)
             if step % diagnostic_interval == 0 or step == args.steps - 1:
@@ -2297,8 +2405,10 @@ def main():
                 )
                 diagnostic = {
                     "step": step,
+                    "finger_x": finger_x,
                     "finger_y_offset": finger_y_offset,
                     "finger_z": finger_z,
+                    **cloth_shape,
                     "active_patch_summaries": _attached_patch_summaries(
                         grasp_state["patches"],
                         particle_positions,
@@ -2335,6 +2445,8 @@ def main():
                 _log("diagnostic " + json.dumps(diagnostic, sort_keys=True))
             if initial_cloth_centroid_z is None:
                 initial_cloth_centroid_z = cloth_centroid_z
+                initial_cloth_centroid_m = cloth_shape["cloth_centroid_m"]
+                initial_cloth_span_m = cloth_shape["cloth_span_m"]
             if attached and grasp_state["patches"]:
                 indices = torch.unique(
                     torch.cat([patch["indices"] for patch in grasp_state["patches"]])
@@ -2353,9 +2465,11 @@ def main():
         if writer is not None:
             writer.detach()
 
-        _cloth_view, _positions, _velocities, final_positions, _particle_velocities = (
-            _torch_cloth_state(cloth)
-        )
+        if final_positions is None:
+            _cloth_view, _positions, _velocities, final_positions, _particle_velocities = (
+                _torch_cloth_state(cloth)
+            )
+        final_cloth_shape = _cloth_shape_diagnostics(final_positions)
         final_cloth_centroid_z = float(torch.mean(final_positions[:, 2]).item())
         final_attached_centroid_z = (
             attached_centroid_z[-1] if attached_centroid_z else None
@@ -2387,6 +2501,17 @@ def main():
             else 0.0
         )
         cloth_lift_m = final_cloth_centroid_z - initial_cloth_centroid_z
+        cloth_slide_m = (
+            final_cloth_shape["cloth_centroid_m"][0] - initial_cloth_centroid_m[0]
+        )
+        cloth_lateral_drift_m = (
+            final_cloth_shape["cloth_centroid_m"][1] - initial_cloth_centroid_m[1]
+        )
+        cloth_span_z_growth_m = (
+            max_cloth_span_z - initial_cloth_span_m[2]
+            if initial_cloth_span_m is not None and max_cloth_span_z is not None
+            else None
+        )
         max_cloth_lift_m = max_cloth_centroid_z - initial_cloth_centroid_z
         success_cloth_lift_m = (
             max_cloth_lift_m
@@ -2399,15 +2524,23 @@ def main():
             if abs(attached_lift_m) > 1e-9
             else None
         )
-        success = bool(
-            (
-                log_state["attached_step"] is not None
-                and attached_lift_m > 0.075
-                and success_cloth_lift_m > 0.025
+        if args.demo_mode == "table-slide":
+            success = bool(
+                cloth_slide_m > 0.020
+                and abs(cloth_lateral_drift_m) < 0.020
+                and cloth_span_z_growth_m is not None
+                and cloth_span_z_growth_m < 0.032
             )
-            if args.explicit_sticking
-            else (max_cloth_lift_m > 0.075 and success_cloth_lift_m > 0.025)
-        )
+        else:
+            success = bool(
+                (
+                    log_state["attached_step"] is not None
+                    and attached_lift_m > 0.075
+                    and success_cloth_lift_m > 0.025
+                )
+                if args.explicit_sticking
+                else (max_cloth_lift_m > 0.075 and success_cloth_lift_m > 0.025)
+            )
 
         video_path = None
         if args.record:
@@ -2419,6 +2552,7 @@ def main():
 
         result = {
             "success": success,
+            "demo_mode": args.demo_mode,
             "steps": args.steps,
             "start_closed": args.start_closed,
             "explicit_sticking": args.explicit_sticking,
@@ -2444,6 +2578,10 @@ def main():
             "sticking_pd_kd": args.sticking_pd_kd,
             "sticking_pd_max_speed": args.sticking_pd_max_speed,
             "finger_lift_z": args.finger_lift_z,
+            "slide_distance": args.slide_distance,
+            "slide_steps": args.slide_steps,
+            "slide_hold_steps": args.slide_hold_steps,
+            "slide_finger_z": args.slide_finger_z,
             "finger_closed_y_offset": args.finger_closed_y_offset,
             "expand_adhesive_patch": args.expand_adhesive_patch,
             "adhesive_patch_max_particles": args.adhesive_patch_max_particles,
@@ -2463,9 +2601,17 @@ def main():
             "attached_particles": log_state["attached_particles"],
             "released_step": log_state["released_step"],
             "initial_cloth_centroid_z": initial_cloth_centroid_z,
+            "initial_cloth_centroid_m": initial_cloth_centroid_m,
+            "initial_cloth_span_m": initial_cloth_span_m,
             "final_cloth_centroid_z": final_cloth_centroid_z,
+            "final_cloth_centroid_m": final_cloth_shape["cloth_centroid_m"],
+            "final_cloth_span_m": final_cloth_shape["cloth_span_m"],
             "max_cloth_centroid_z": max_cloth_centroid_z,
+            "max_cloth_span_z_m": max_cloth_span_z,
             "cloth_lift_m": cloth_lift_m,
+            "cloth_slide_m": cloth_slide_m,
+            "cloth_lateral_drift_m": cloth_lateral_drift_m,
+            "cloth_span_z_growth_m": cloth_span_z_growth_m,
             "max_cloth_lift_m": max_cloth_lift_m,
             "success_cloth_lift_m": success_cloth_lift_m,
             "initial_attached_centroid_z": initial_attached_centroid_z,
