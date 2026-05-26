@@ -222,6 +222,18 @@ def _parse_args():
         help="Maximum gap between opposing surfaces for a compressed adhesive contact.",
     )
     parser.add_argument(
+        "--cloth-rest-offset",
+        type=float,
+        default=TOY_CLOTH_REST_OFFSET,
+        help="PhysX particle-system rest offset for the toy cloth.",
+    )
+    parser.add_argument(
+        "--cloth-contact-offset",
+        type=float,
+        default=TOY_CLOTH_CONTACT_OFFSET,
+        help="PhysX particle-system contact and particle-contact offset.",
+    )
+    parser.add_argument(
         "--adhesive-local-patch-radius",
         type=float,
         default=0.0,
@@ -2020,8 +2032,12 @@ def _compose_video(frame_dir: Path, video_path: Path, fps: int):
 
 def main():
     args = _parse_args()
-    global ADHESIVE_PRESS_GAP, TOY_STICKING_DEBUG
+    global ADHESIVE_PRESS_GAP, ADHESIVE_SIGNED_NORMAL_SLOP
+    global TOY_CLOTH_CONTACT_OFFSET, TOY_CLOTH_REST_OFFSET, TOY_STICKING_DEBUG
     ADHESIVE_PRESS_GAP = args.adhesive_press_gap
+    TOY_CLOTH_REST_OFFSET = args.cloth_rest_offset
+    TOY_CLOTH_CONTACT_OFFSET = args.cloth_contact_offset
+    ADHESIVE_SIGNED_NORMAL_SLOP = args.cloth_contact_offset
     TOY_STICKING_DEBUG = args.sticking_debug
     args.output_root.mkdir(parents=True, exist_ok=True)
     result_json = args.result_json or args.output_root / "result.json"
