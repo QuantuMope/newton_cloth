@@ -2471,6 +2471,13 @@ def main():
             log_state["step"] = step
             attached = False
             def _run_sticking_update():
+                # Existing patches have a contact-based lifecycle: keep driving
+                # them only while the same compressed surface-pair proxy that
+                # created them still validates. Isaac's cloth tensor path does
+                # not expose per-particle physical contact impulses here, so
+                # this geometric proxy is the release condition until a PhysX
+                # contact-force backend is available. Script phase only gates
+                # creation of new patches.
                 return (
                     _drive_attached_patch(
                         stage,
