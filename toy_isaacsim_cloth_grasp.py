@@ -40,7 +40,6 @@ from isaacsim_newton_scene import (
     OBJECT_ADHESIVE_SURFACE_FRICTION,
     TABLE_CENTER,
     TABLE_FRICTION_COMBINE_MODE,
-    TABLE_PHYSICS_FRICTION,
     TABLE_SCALE,
     _active_adhesive_surfaces,
     _bind_material,
@@ -60,32 +59,48 @@ from isaacsim_newton_scene import (
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = ROOT_DIR / "recordings" / "toy_isaacsim_cloth_grasp"
-FINGER_SIZE = (0.026, 0.002, GRIPPER_FINGER_COLLISION_BOX_SIZE[1])
+FINGER_SIZE = (0.026, 0.003, GRIPPER_FINGER_COLLISION_BOX_SIZE[1])
 TOY_CLOTH_CENTER = (-0.15, TABLE_CENTER[1], TABLE_CENTER[2] + 0.075)
 FINGER_CENTER_X = TOY_CLOTH_CENTER[0]
 FINGER_START_Y_OFFSET = 0.070
 # Keep a physical gap for folded cloth while preserving finger normal force.
-FINGER_CLOSED_Y_OFFSET = 0.006
+FINGER_CLOSED_Y_OFFSET = 0.004
 FINGER_PRESS_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.043
 FINGER_START_Z = FINGER_PRESS_Z + 0.030
 FINGER_CLOSE_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.067
 FINGER_LIFT_Z = TABLE_CENTER[2] + 0.5 * TABLE_SCALE[2] + 0.220
 FINGER_INNER_ATTACH_NORMAL_OFFSET = 0.006
+FINGER_PARK_Y_OFFSET = 0.300
+FINGER_PARK_Z = FINGER_START_Z + 0.050
 ADHESIVE_PRESS_GAP = 0.024
 TOY_CLOTH_REST_OFFSET = 0.003
 TOY_CLOTH_CONTACT_OFFSET = 0.003
 ADHESIVE_SIGNED_NORMAL_SLOP = TOY_CLOTH_CONTACT_OFFSET
 TOY_GRIPPER_PHYSICS_FRICTION = (0.1, 0.08)
+TOY_TABLE_PHYSICS_FRICTION = (0.02, 0.01)
 TOY_TABLE_SLIDE_DISTANCE = 0.080
+TOY_TABLE_SLIDE_APPROACH_Z = FINGER_PARK_Z
 TOY_TABLE_SLIDE_FINGER_Z = FINGER_PRESS_Z - 0.002
+TOY_TABLE_SLIDE_SETTLE_STEPS = 60
 TOY_CLOTH_TOTAL_MASS = 0.050
-TOY_CLOTH_GRID_COLUMNS = 49 + 1
-TOY_CLOTH_GRID_ROWS = 33 + 1
+TOY_CLOTH_WIDTH = 0.33
+TOY_CLOTH_HEIGHT = 0.22
+TOY_TABLE_SLIDE_START_X = (
+    TOY_CLOTH_CENTER[0] - 0.5 * TOY_CLOTH_WIDTH - 0.5 * FINGER_SIZE[0] + 0.006
+)
+TOY_CLOTH_GRID_X = 165
+TOY_CLOTH_GRID_Y = 110
+TOY_CLOTH_GRID_COLUMNS = TOY_CLOTH_GRID_X + 1
+TOY_CLOTH_GRID_ROWS = TOY_CLOTH_GRID_Y + 1
 TOY_CLOTH_PARTICLE_COUNT = TOY_CLOTH_GRID_COLUMNS * TOY_CLOTH_GRID_ROWS
 TOY_CLOTH_PARTICLE_MASS = TOY_CLOTH_TOTAL_MASS / TOY_CLOTH_PARTICLE_COUNT
-TOY_CLOTH_STRETCH_STIFFNESS = 6000.0
+TOY_CLOTH_PARTICLE_SPACING = (
+    TOY_CLOTH_WIDTH / TOY_CLOTH_GRID_X,
+    TOY_CLOTH_HEIGHT / TOY_CLOTH_GRID_Y,
+)
+TOY_CLOTH_STRETCH_STIFFNESS = 4500.0
 TOY_CLOTH_BEND_STIFFNESS = 10.0
-TOY_CLOTH_SHEAR_STIFFNESS = 2000.0
+TOY_CLOTH_SHEAR_STIFFNESS = 1500.0
 TOY_CLOTH_SPRING_DAMPING = 8.0
 TOY_CLOTH_SOLVER_POSITION_ITERATIONS = 96
 TOY_NONANCHOR_VELOCITY_DAMPING = 0.94
@@ -141,7 +156,7 @@ def _parse_args():
     )
     parser.add_argument(
         "--demo-mode",
-        choices=("grasp", "table-slide"),
+        choices=("grasp", "table-slide", "gravity-fold"),
         default="grasp",
         help="Scripted toy action sequence to run.",
     )
@@ -176,6 +191,12 @@ def _parse_args():
     parser.add_argument("--lift-steps", type=int, default=180)
     parser.add_argument("--slide-steps", type=int, default=120)
     parser.add_argument("--slide-hold-steps", type=int, default=30)
+    parser.add_argument(
+        "--table-slide-settle-steps",
+        type=int,
+        default=TOY_TABLE_SLIDE_SETTLE_STEPS,
+        help="Initial table-slide-only settle steps before lowering fingers.",
+    )
     parser.add_argument(
         "--slide-distance",
         type=float,
@@ -228,14 +249,18 @@ def _parse_args():
     parser.add_argument(
         "--adhesive-min-component-particles",
         type=int,
-        default=3,
+        default=8,
         help="Minimum grid-connected contact particles needed to create a patch.",
     )
     parser.add_argument(
         "--adhesive-patch-max-particles",
         type=int,
-        default=64,
-        help="Maximum compressed contact particles to attach before optional expansion.",
+        default=128,
+        help=(
+            "Maximum compressed contact particles to attach before optional "
+            "expansion; nonpositive keeps the full contact component. The "
+            "default keeps dense contact patches from becoming rigid plates."
+        ),
     )
     parser.add_argument(
         "--adhesive-press-gap",
@@ -452,13 +477,13 @@ def _parse_args():
     parser.add_argument(
         "--table-static-friction",
         type=float,
-        default=TABLE_PHYSICS_FRICTION[0],
+        default=TOY_TABLE_PHYSICS_FRICTION[0],
         help="Toy table static friction used by the physics material.",
     )
     parser.add_argument(
         "--table-dynamic-friction",
         type=float,
-        default=TABLE_PHYSICS_FRICTION[1],
+        default=TOY_TABLE_PHYSICS_FRICTION[1],
         help="Toy table dynamic friction used by the physics material.",
     )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -543,21 +568,30 @@ def _set_finger_pose(prim, position):
     prim.set_world_pose(position=np.asarray(position, dtype=np.float32))
 
 
-def _create_tabletop_cloth(stage, world, material):
+def _create_tabletop_cloth(stage, world, material, initial_fold: bool = False):
     from isaacsim.core.api.materials.particle_material import ParticleMaterial
     from isaacsim.core.prims import SingleClothPrim, SingleParticleSystem
     from pxr import Gf, UsdGeom
 
     mesh = UsdGeom.Mesh.Define(stage, "/World/ToyCloth")
-    points, counts, indices = _grid_mesh(0.33, 0.22, 49, 33, 0.002)
-    translated_points = [
-        Gf.Vec3f(
-            float(x + TOY_CLOTH_CENTER[0]),
-            float(y + TOY_CLOTH_CENTER[1]),
-            float(z + TOY_CLOTH_CENTER[2]),
+    points, counts, indices = _grid_mesh(
+        TOY_CLOTH_WIDTH,
+        TOY_CLOTH_HEIGHT,
+        TOY_CLOTH_GRID_X,
+        TOY_CLOTH_GRID_Y,
+        0.002,
+    )
+    translated_points = []
+    for x, y, z in points:
+        folded_x = -abs(x) if initial_fold and x > 0.0 else x
+        folded_z = z + (0.010 if initial_fold and x > 0.0 else 0.0)
+        translated_points.append(
+            Gf.Vec3f(
+                float(folded_x + TOY_CLOTH_CENTER[0]),
+                float(y + TOY_CLOTH_CENTER[1]),
+                float(folded_z + TOY_CLOTH_CENTER[2]),
+            )
         )
-        for x, y, z in points
-    ]
     mesh.CreatePointsAttr(translated_points)
     mesh.CreateFaceVertexCountsAttr(counts)
     mesh.CreateFaceVertexIndicesAttr(indices)
@@ -1227,11 +1261,46 @@ def _cloth_shape_diagnostics(particle_positions):
     minimum = torch.min(particle_positions, dim=0).values
     maximum = torch.max(particle_positions, dim=0).values
     span = maximum - minimum
+    columns = torch.arange(
+        TOY_CLOTH_GRID_COLUMNS,
+        device=particle_positions.device,
+    ).repeat(TOY_CLOTH_GRID_ROWS)
+    front_mask = columns >= (TOY_CLOTH_GRID_COLUMNS // 2)
+    front_centroid = torch.mean(particle_positions[front_mask], dim=0)
     return {
         "cloth_centroid_m": [float(value.item()) for value in centroid],
         "cloth_min_m": [float(value.item()) for value in minimum],
         "cloth_max_m": [float(value.item()) for value in maximum],
         "cloth_span_m": [float(value.item()) for value in span],
+        "front_cloth_centroid_m": [
+            float(value.item()) for value in front_centroid
+        ],
+    }
+
+
+def _extreme_particle_diagnostics(particle_positions, particle_velocities, patches):
+    min_z_index = int(torch.argmin(particle_positions[:, 2]).item())
+    max_z_index = int(torch.argmax(particle_positions[:, 2]).item())
+    attached_modes_by_index = {}
+    for patch in patches:
+        for index in patch["indices"].detach().cpu().tolist():
+            attached_modes_by_index[int(index)] = patch["mode"]
+
+    def particle_summary(index):
+        return {
+            "index": index,
+            "position_m": [
+                float(value.item()) for value in particle_positions[index]
+            ],
+            "velocity_mps": [
+                float(value.item()) for value in particle_velocities[index]
+            ],
+            "attached_mode": attached_modes_by_index.get(index),
+        }
+
+    return {
+        "min_z_particle": particle_summary(min_z_index),
+        "max_z_particle": particle_summary(max_z_index),
     }
 
 
@@ -2155,13 +2224,14 @@ def _grasp_script_state(args, step: int) -> dict:
 
 
 def _table_slide_script_state(args, step: int) -> dict:
-    lower_amount = (step - args.settle_steps) / max(args.lower_steps, 1)
+    settle_steps = max(args.settle_steps, args.table_slide_settle_steps)
+    lower_amount = (step - settle_steps) / max(args.lower_steps, 1)
     slide_amount = (
-        step - args.settle_steps - args.lower_steps
+        step - settle_steps - args.lower_steps
     ) / max(args.slide_steps, 1)
     release_amount = (
         step
-        - args.settle_steps
+        - settle_steps
         - args.lower_steps
         - args.slide_steps
         - args.slide_hold_steps
@@ -2170,9 +2240,13 @@ def _table_slide_script_state(args, step: int) -> dict:
     slide_fraction = min(max(slide_amount, 0.0), 1.0)
     release_fraction = min(max(release_amount, 0.0), 1.0)
     return {
-        "finger_x": FINGER_CENTER_X + args.slide_distance * slide_fraction,
+        "finger_x": TOY_TABLE_SLIDE_START_X + args.slide_distance * slide_fraction,
         "finger_y_offset": FINGER_START_Y_OFFSET,
-        "finger_z": _lerp(FINGER_START_Z, args.slide_finger_z, lower_amount),
+        "finger_z": _lerp(
+            TOY_TABLE_SLIDE_APPROACH_Z,
+            args.slide_finger_z,
+            lower_amount,
+        ),
         "lower_fraction": lower_fraction,
         "close_fraction": 0.0,
         "release_fraction": release_fraction,
@@ -2187,9 +2261,26 @@ def _table_slide_script_state(args, step: int) -> dict:
     }
 
 
+def _gravity_fold_script_state(args, step: int) -> dict:
+    return {
+        "finger_x": FINGER_CENTER_X,
+        "finger_y_offset": FINGER_PARK_Y_OFFSET,
+        "finger_z": FINGER_PARK_Z,
+        "lower_fraction": 0.0,
+        "close_fraction": 0.0,
+        "release_fraction": 0.0,
+        "allow_new_attachment": False,
+        "upgrade_to_finger_pinch": False,
+        "handoff_to_inner_patches": False,
+        "fold_cloth_sticking": False,
+    }
+
+
 def _script_state(args, step: int) -> dict:
     if args.demo_mode == "table-slide":
         return _table_slide_script_state(args, step)
+    if args.demo_mode == "gravity-fold":
+        return _gravity_fold_script_state(args, step)
     return _grasp_script_state(args, step)
 
 
@@ -2264,7 +2355,12 @@ def main():
             finger_physics_material,
             (FINGER_CENTER_X, TABLE_CENTER[1] + initial_y_offset, initial_finger_z),
         )
-        cloth = _create_tabletop_cloth(stage, world, cloth_material)
+        cloth = _create_tabletop_cloth(
+            stage,
+            world,
+            cloth_material,
+            initial_fold=args.demo_mode in ("gravity-fold", "table-slide"),
+        )
         camera_path = _create_camera(
             stage,
             "/World/Camera",
@@ -2296,6 +2392,7 @@ def main():
         diagnostic_snapshots = []
         initial_cloth_centroid_z = None
         initial_cloth_centroid_m = None
+        initial_front_cloth_centroid_m = None
         initial_cloth_span_m = None
         max_cloth_centroid_z = None
         max_cloth_span_z = None
@@ -2376,7 +2473,11 @@ def main():
 
             if args.sticking_update_phase in ("before-step", "both"):
                 attached = _run_sticking_update()
-            world.step(render=args.live_render)
+            # Particle cloth render buffers are not reliably refreshed by a
+            # later capture-only Replicator step. When recording, render as
+            # part of the physics step so the video follows the simulated cloth
+            # state without asking Replicator to advance physics again.
+            world.step(render=args.live_render or args.record)
             if args.sticking_update_phase in ("after-step", "both"):
                 attached = _run_sticking_update() or attached
             _cloth_view, _positions, _velocities, particle_positions, _particle_velocities = (
@@ -2428,6 +2529,11 @@ def main():
                         grasp_state["patches"],
                         particle_positions,
                     ),
+                    **_extreme_particle_diagnostics(
+                        particle_positions,
+                        _particle_velocities,
+                        grasp_state["patches"],
+                    ),
                     **_diagnose_surface_contacts(active_surfaces, particle_positions),
                     "named_surface_contacts": _diagnose_named_surface_contacts(
                         active_surfaces,
@@ -2446,6 +2552,9 @@ def main():
             if initial_cloth_centroid_z is None:
                 initial_cloth_centroid_z = cloth_centroid_z
                 initial_cloth_centroid_m = cloth_shape["cloth_centroid_m"]
+                initial_front_cloth_centroid_m = cloth_shape[
+                    "front_cloth_centroid_m"
+                ]
                 initial_cloth_span_m = cloth_shape["cloth_span_m"]
             if attached and grasp_state["patches"]:
                 indices = torch.unique(
@@ -2456,7 +2565,13 @@ def main():
                 )
 
             if rep is not None:
-                rep.orchestrator.step(rt_subframes=args.rt_subframes)
+                # Capture the state produced by world.step() without letting
+                # Replicator advance the physics timeline a second time.
+                rep.orchestrator.step(
+                    rt_subframes=args.rt_subframes,
+                    pause_timeline=False,
+                    delta_time=0.0,
+                )
             if args.live_render and args.live_step_seconds > 0.0:
                 time.sleep(args.live_step_seconds)
 
@@ -2504,6 +2619,10 @@ def main():
         cloth_slide_m = (
             final_cloth_shape["cloth_centroid_m"][0] - initial_cloth_centroid_m[0]
         )
+        front_cloth_slide_m = (
+            final_cloth_shape["front_cloth_centroid_m"][0]
+            - initial_front_cloth_centroid_m[0]
+        )
         cloth_lateral_drift_m = (
             final_cloth_shape["cloth_centroid_m"][1] - initial_cloth_centroid_m[1]
         )
@@ -2531,15 +2650,26 @@ def main():
                 and cloth_span_z_growth_m is not None
                 and cloth_span_z_growth_m < 0.032
             )
+        elif args.demo_mode == "gravity-fold":
+            success = bool(
+                max_cloth_span_z is not None
+                and max_cloth_span_z < 0.050
+                and final_cloth_shape["cloth_span_m"][2] < 0.040
+            )
         else:
             success = bool(
                 (
                     log_state["attached_step"] is not None
                     and attached_lift_m > 0.075
                     and success_cloth_lift_m > 0.025
+                    and max_cloth_span_z < 1.0
                 )
                 if args.explicit_sticking
-                else (max_cloth_lift_m > 0.075 and success_cloth_lift_m > 0.025)
+                else (
+                    max_cloth_lift_m > 0.075
+                    and success_cloth_lift_m > 0.025
+                    and max_cloth_span_z < 1.0
+                )
             )
 
         video_path = None
@@ -2582,6 +2712,7 @@ def main():
             "slide_steps": args.slide_steps,
             "slide_hold_steps": args.slide_hold_steps,
             "slide_finger_z": args.slide_finger_z,
+            "finger_size_m": list(FINGER_SIZE),
             "finger_closed_y_offset": args.finger_closed_y_offset,
             "expand_adhesive_patch": args.expand_adhesive_patch,
             "adhesive_patch_max_particles": args.adhesive_patch_max_particles,
@@ -2593,6 +2724,12 @@ def main():
             ),
             "cloth_rest_offset": TOY_CLOTH_REST_OFFSET,
             "cloth_contact_offset": TOY_CLOTH_CONTACT_OFFSET,
+            "cloth_grid_x": TOY_CLOTH_GRID_X,
+            "cloth_grid_y": TOY_CLOTH_GRID_Y,
+            "cloth_particle_spacing_m": list(TOY_CLOTH_PARTICLE_SPACING),
+            "cloth_stretch_stiffness": TOY_CLOTH_STRETCH_STIFFNESS,
+            "cloth_shear_stiffness": TOY_CLOTH_SHEAR_STIFFNESS,
+            "cloth_bend_stiffness": TOY_CLOTH_BEND_STIFFNESS,
             "finger_static_friction": args.finger_static_friction,
             "finger_dynamic_friction": args.finger_dynamic_friction,
             "table_static_friction": args.table_static_friction,
@@ -2602,14 +2739,19 @@ def main():
             "released_step": log_state["released_step"],
             "initial_cloth_centroid_z": initial_cloth_centroid_z,
             "initial_cloth_centroid_m": initial_cloth_centroid_m,
+            "initial_front_cloth_centroid_m": initial_front_cloth_centroid_m,
             "initial_cloth_span_m": initial_cloth_span_m,
             "final_cloth_centroid_z": final_cloth_centroid_z,
             "final_cloth_centroid_m": final_cloth_shape["cloth_centroid_m"],
+            "final_front_cloth_centroid_m": final_cloth_shape[
+                "front_cloth_centroid_m"
+            ],
             "final_cloth_span_m": final_cloth_shape["cloth_span_m"],
             "max_cloth_centroid_z": max_cloth_centroid_z,
             "max_cloth_span_z_m": max_cloth_span_z,
             "cloth_lift_m": cloth_lift_m,
             "cloth_slide_m": cloth_slide_m,
+            "front_cloth_slide_m": front_cloth_slide_m,
             "cloth_lateral_drift_m": cloth_lateral_drift_m,
             "cloth_span_z_growth_m": cloth_span_z_growth_m,
             "max_cloth_lift_m": max_cloth_lift_m,

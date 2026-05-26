@@ -478,7 +478,9 @@ def make_adhesive_patch(
     if local_candidate_indices.numel() == 0:
         return None
 
-    local_order = torch.argsort(local_pair_score)[:adhesive_patch_max_particles]
+    local_order = torch.argsort(local_pair_score)
+    if int(adhesive_patch_max_particles) > 0:
+        local_order = local_order[:adhesive_patch_max_particles]
     seed_indices = local_candidate_indices[local_order]
     selected_indices = (
         expand_adhesive_patch_indices(
