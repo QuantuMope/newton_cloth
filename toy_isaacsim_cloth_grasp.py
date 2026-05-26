@@ -103,6 +103,7 @@ TOY_CLOTH_BEND_STIFFNESS = 10.0
 TOY_CLOTH_SHEAR_STIFFNESS = 1500.0
 TOY_CLOTH_SPRING_DAMPING = 8.0
 TOY_CLOTH_SOLVER_POSITION_ITERATIONS = 96
+TOY_CLOTH_MAX_VELOCITY = 2.0
 TOY_NONANCHOR_VELOCITY_DAMPING = 0.94
 TOY_FOLD_PAIR_STRENGTH = 0.60
 TOY_PHYSICS_DT = 1.0 / 120.0
@@ -279,6 +280,36 @@ def _parse_args():
         type=float,
         default=TOY_CLOTH_CONTACT_OFFSET,
         help="PhysX particle-system contact and particle-contact offset.",
+    )
+    parser.add_argument(
+        "--cloth-particle-damping",
+        type=float,
+        default=CLOTH_PARTICLE_DAMPING,
+        help="PhysX PBD particle material damping for the toy cloth.",
+    )
+    parser.add_argument(
+        "--cloth-spring-damping",
+        type=float,
+        default=TOY_CLOTH_SPRING_DAMPING,
+        help="Spring damping for the toy cloth.",
+    )
+    parser.add_argument(
+        "--cloth-max-velocity",
+        type=float,
+        default=TOY_CLOTH_MAX_VELOCITY,
+        help="PhysX particle-system max velocity for toy cloth particles.",
+    )
+    parser.add_argument(
+        "--cloth-self-collision",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable PhysX particle cloth self-collision.",
+    )
+    parser.add_argument(
+        "--cloth-self-collision-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Filter adjacent particle self-collisions for the toy cloth.",
     )
     parser.add_argument(
         "--adhesive-local-patch-radius",
@@ -568,7 +599,17 @@ def _set_finger_pose(prim, position):
     prim.set_world_pose(position=np.asarray(position, dtype=np.float32))
 
 
-def _create_tabletop_cloth(stage, world, material, initial_fold: bool = False):
+def _create_tabletop_cloth(
+    stage,
+    world,
+    material,
+    initial_fold: bool = False,
+    self_collision: bool = True,
+    self_collision_filter: bool = True,
+    particle_damping: float = CLOTH_PARTICLE_DAMPING,
+    spring_damping: float = TOY_CLOTH_SPRING_DAMPING,
+    max_velocity: float = TOY_CLOTH_MAX_VELOCITY,
+):
     from isaacsim.core.api.materials.particle_material import ParticleMaterial
     from isaacsim.core.prims import SingleClothPrim, SingleParticleSystem
     from pxr import Gf, UsdGeom
@@ -604,7 +645,7 @@ def _create_tabletop_cloth(stage, world, material, initial_fold: bool = False):
         lift=0.0,
         friction=CLOTH_PARTICLE_FRICTION,
         particle_friction_scale=CLOTH_PARTICLE_FRICTION_SCALE,
-        damping=CLOTH_PARTICLE_DAMPING,
+        damping=particle_damping,
         adhesion=CLOTH_PARTICLE_ADHESION,
         particle_adhesion_scale=CLOTH_PARTICLE_ADHESION_SCALE,
         adhesion_offset_scale=CLOTH_ADHESION_OFFSET_SCALE,
@@ -613,7 +654,7 @@ def _create_tabletop_cloth(stage, world, material, initial_fold: bool = False):
         "created toy cloth PBD material: "
         f"friction={CLOTH_PARTICLE_FRICTION} "
         f"particle_friction_scale={CLOTH_PARTICLE_FRICTION_SCALE} "
-        f"damping={CLOTH_PARTICLE_DAMPING} "
+        f"damping={particle_damping} "
         f"adhesion={CLOTH_PARTICLE_ADHESION} "
         f"particle_adhesion_scale={CLOTH_PARTICLE_ADHESION_SCALE} "
         f"adhesion_offset_scale={CLOTH_ADHESION_OFFSET_SCALE}"
@@ -628,8 +669,8 @@ def _create_tabletop_cloth(stage, world, material, initial_fold: bool = False):
         fluid_rest_offset=TOY_CLOTH_REST_OFFSET,
         particle_contact_offset=TOY_CLOTH_CONTACT_OFFSET,
         solver_position_iteration_count=TOY_CLOTH_SOLVER_POSITION_ITERATIONS,
-        max_velocity=10.0,
-        global_self_collision_enabled=True,
+        max_velocity=max_velocity,
+        global_self_collision_enabled=self_collision,
         non_particle_collision_enabled=True,
     )
     particle_system.set_simulation_owner(world.get_physics_context().prim_path)
@@ -639,12 +680,12 @@ def _create_tabletop_cloth(stage, world, material, initial_fold: bool = False):
         particle_material=particle_material,
         name="toy_cloth",
         particle_mass=TOY_CLOTH_PARTICLE_MASS,
-        self_collision=True,
-        self_collision_filter=True,
+        self_collision=self_collision,
+        self_collision_filter=self_collision_filter,
         stretch_stiffness=TOY_CLOTH_STRETCH_STIFFNESS,
         bend_stiffness=TOY_CLOTH_BEND_STIFFNESS,
         shear_stiffness=TOY_CLOTH_SHEAR_STIFFNESS,
-        spring_damping=TOY_CLOTH_SPRING_DAMPING,
+        spring_damping=spring_damping,
     )
     world.scene.add(cloth)
     return cloth
@@ -2360,6 +2401,11 @@ def main():
             world,
             cloth_material,
             initial_fold=args.demo_mode in ("gravity-fold", "table-slide"),
+            self_collision=args.cloth_self_collision,
+            self_collision_filter=args.cloth_self_collision_filter,
+            particle_damping=args.cloth_particle_damping,
+            spring_damping=args.cloth_spring_damping,
+            max_velocity=args.cloth_max_velocity,
         )
         camera_path = _create_camera(
             stage,
@@ -2424,12 +2470,6 @@ def main():
 
             log_state["step"] = step
             attached = False
-            if release_fraction > 0.0 and grasp_state["patches"]:
-                grasp_state["patches"] = []
-                grasp_state["fold_pairs"] = None
-                log_state["released_step"] = step
-                _log(f"released adhesive patches at step {step}")
-
             def _run_sticking_update():
                 return (
                     _drive_attached_patch(
@@ -2467,19 +2507,45 @@ def main():
                         args.validate_sticking_contact,
                         args.add_new_contact_patches,
                     )
-                    if args.explicit_sticking and release_fraction <= 0.0
+                    if args.explicit_sticking
+                    and (release_fraction <= 0.0 or grasp_state["patches"])
                     else False
                 )
 
             if args.sticking_update_phase in ("before-step", "both"):
+                had_patches = bool(grasp_state["patches"])
                 attached = _run_sticking_update()
-            # Particle cloth render buffers are not reliably refreshed by a
-            # later capture-only Replicator step. When recording, render as
-            # part of the physics step so the video follows the simulated cloth
-            # state without asking Replicator to advance physics again.
-            world.step(render=args.live_render or args.record)
+                if (
+                    release_fraction > 0.0
+                    and had_patches
+                    and not grasp_state["patches"]
+                    and log_state["released_step"] is None
+                ):
+                    grasp_state["fold_pairs"] = None
+                    log_state["released_step"] = step
+                    _log(f"released adhesive patches at step {step}")
+            # Keep scripted control at the physics tick. world.step(render=True)
+            # advances through the app/render cadence, so with rendering_dt >
+            # physics_dt it can advance several physics ticks under one
+            # kinematic finger target and destabilize cloth contact. A separate
+            # render() call refreshes Fabric/render buffers without advancing
+            # physics, so recorded frames still follow the particle state.
+            should_render = args.live_render or args.record
+            world.step(render=False, update_fabric=should_render)
+            if should_render:
+                world.render()
             if args.sticking_update_phase in ("after-step", "both"):
+                had_patches = bool(grasp_state["patches"])
                 attached = _run_sticking_update() or attached
+                if (
+                    release_fraction > 0.0
+                    and had_patches
+                    and not grasp_state["patches"]
+                    and log_state["released_step"] is None
+                ):
+                    grasp_state["fold_pairs"] = None
+                    log_state["released_step"] = step
+                    _log(f"released adhesive patches at step {step}")
             _cloth_view, _positions, _velocities, particle_positions, _particle_velocities = (
                 _torch_cloth_state(cloth)
             )
@@ -2724,6 +2790,11 @@ def main():
             ),
             "cloth_rest_offset": TOY_CLOTH_REST_OFFSET,
             "cloth_contact_offset": TOY_CLOTH_CONTACT_OFFSET,
+            "cloth_self_collision": args.cloth_self_collision,
+            "cloth_self_collision_filter": args.cloth_self_collision_filter,
+            "cloth_particle_damping": args.cloth_particle_damping,
+            "cloth_spring_damping": args.cloth_spring_damping,
+            "cloth_max_velocity": args.cloth_max_velocity,
             "cloth_grid_x": TOY_CLOTH_GRID_X,
             "cloth_grid_y": TOY_CLOTH_GRID_Y,
             "cloth_particle_spacing_m": list(TOY_CLOTH_PARTICLE_SPACING),

@@ -945,11 +945,17 @@ def attached_patch_summaries(
             torch.max(patch_positions, dim=0).values
             - torch.min(patch_positions, dim=0).values
         )
+        patch_indices = patch["indices"].detach().cpu()
         summaries.append(
             {
                 "mode": patch["mode"],
                 "anchor_name": patch["anchor_name"],
                 "particles": int(patch["indices"].numel()),
+                "index_min": int(torch.min(patch_indices).item()),
+                "index_max": int(torch.max(patch_indices).item()),
+                "index_sample": [
+                    int(value.item()) for value in patch_indices[:8]
+                ],
                 "seed_count": patch.get("seed_count"),
                 "candidate_count": patch.get("candidate_count"),
                 "span_m": [float(value.item()) for value in patch_span],
