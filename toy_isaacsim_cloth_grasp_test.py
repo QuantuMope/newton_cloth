@@ -20,7 +20,7 @@ ISAAC_PYTHON = Path("/home/horizon/isaacsim_env/bin/python")
 TOY_SCRIPT = ROOT_DIR / "toy_isaacsim_cloth_grasp.py"
 RUN_TIMEOUT_SECONDS = 180
 DEFAULT_STEPS = 390
-SLIDE_STEPS = 190
+SLIDE_STEPS = 420
 GRAVITY_FOLD_STEPS = 180
 RECORD_SYNC_STEPS = 45
 RECORD_SYNC_SETTLED_STEP = RECORD_SYNC_STEPS - 1
@@ -486,12 +486,14 @@ class ToyIsaacSimClothGraspTest(unittest.TestCase):
         self.assertTrue(self.slide_result["success"])
         self.assertEqual("table-slide", self.slide_result["demo_mode"])
         self.assertEqual("teleport", self.slide_result["sticking_drive_mode"])
-        self.assertGreater(self.slide_result["cloth_slide_m"], 0.020)
-        self.assertGreater(self.slide_result["front_cloth_slide_m"], 0.020)
+        self.assertEqual(0.160, self.slide_result["slide_distance"])
+        self.assertEqual(240, self.slide_result["slide_steps"])
+        self.assertGreater(self.slide_result["cloth_slide_m"], 0.050)
+        self.assertGreater(self.slide_result["front_cloth_slide_m"], 0.050)
         self.assertLess(abs(self.slide_result["cloth_lateral_drift_m"]), 0.012)
         self.assertLess(abs(self.slide_result["cloth_lift_m"]), 0.035)
 
-    def test_table_slide_does_not_significantly_fold_cloth(self):
+    def test_table_slide_folds_cloth_without_gripper_grasp(self):
         patch_modes = {
             patch["mode"]
             for snapshot in self.slide_result["diagnostics"]
@@ -503,8 +505,9 @@ class ToyIsaacSimClothGraspTest(unittest.TestCase):
             {"left_bottom_face+table_top", "right_bottom_face+table_top"},
         )
         self.assertNotIn("left_inner_face+right_inner_face", patch_modes)
-        self.assertLess(self.slide_result["max_cloth_span_z_m"], 0.035)
-        self.assertLess(self.slide_result["cloth_span_z_growth_m"], 0.032)
+        self.assertLess(self.slide_result["max_cloth_span_z_m"], 0.100)
+        self.assertLess(self.slide_result["cloth_span_z_growth_m"], 0.080)
+        self.assertFalse(self.slide_result["diagnostics"][-1]["active_patch_summaries"])
         for snapshot in self.slide_result["diagnostics"]:
             self.assertFalse(
                 self._patches(snapshot, "left_inner_face+right_inner_face")

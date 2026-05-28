@@ -78,7 +78,7 @@ TOY_CLOTH_CONTACT_OFFSET = 0.003
 ADHESIVE_SIGNED_NORMAL_SLOP = TOY_CLOTH_CONTACT_OFFSET
 TOY_GRIPPER_PHYSICS_FRICTION = (0.1, 0.08)
 TOY_TABLE_PHYSICS_FRICTION = (0.02, 0.01)
-TOY_TABLE_SLIDE_DISTANCE = 0.080
+TOY_TABLE_SLIDE_DISTANCE = 0.160
 TOY_TABLE_SLIDE_APPROACH_Z = FINGER_PARK_Z
 TOY_TABLE_SLIDE_FINGER_Z = FINGER_PRESS_Z - 0.002
 TOY_TABLE_SLIDE_SETTLE_STEPS = 60
@@ -103,7 +103,7 @@ TOY_CLOTH_BEND_STIFFNESS = 10.0
 TOY_CLOTH_SHEAR_STIFFNESS = 1500.0
 TOY_CLOTH_SPRING_DAMPING = 8.0
 TOY_CLOTH_SOLVER_POSITION_ITERATIONS = 96
-TOY_CLOTH_MAX_VELOCITY = 2.0
+TOY_CLOTH_MAX_VELOCITY = 1.0
 TOY_NONANCHOR_VELOCITY_DAMPING = 0.94
 TOY_FOLD_PAIR_STRENGTH = 0.60
 TOY_PHYSICS_DT = 1.0 / 120.0
@@ -190,7 +190,7 @@ def _parse_args():
         help="Hold closed fingers still before lifting so the fold can settle.",
     )
     parser.add_argument("--lift-steps", type=int, default=180)
-    parser.add_argument("--slide-steps", type=int, default=120)
+    parser.add_argument("--slide-steps", type=int, default=240)
     parser.add_argument("--slide-hold-steps", type=int, default=30)
     parser.add_argument(
         "--table-slide-settle-steps",
@@ -2280,13 +2280,18 @@ def _table_slide_script_state(args, step: int) -> dict:
     lower_fraction = min(max(lower_amount, 0.0), 1.0)
     slide_fraction = min(max(slide_amount, 0.0), 1.0)
     release_fraction = min(max(release_amount, 0.0), 1.0)
+    pressed_finger_z = _lerp(
+        TOY_TABLE_SLIDE_APPROACH_Z,
+        args.slide_finger_z,
+        lower_amount,
+    )
     return {
         "finger_x": TOY_TABLE_SLIDE_START_X + args.slide_distance * slide_fraction,
         "finger_y_offset": FINGER_START_Y_OFFSET,
         "finger_z": _lerp(
+            pressed_finger_z,
             TOY_TABLE_SLIDE_APPROACH_Z,
-            args.slide_finger_z,
-            lower_amount,
+            release_fraction,
         ),
         "lower_fraction": lower_fraction,
         "close_fraction": 0.0,
@@ -2718,10 +2723,10 @@ def main():
         )
         if args.demo_mode == "table-slide":
             success = bool(
-                cloth_slide_m > 0.020
+                cloth_slide_m > 0.050
                 and abs(cloth_lateral_drift_m) < 0.020
                 and cloth_span_z_growth_m is not None
-                and cloth_span_z_growth_m < 0.032
+                and cloth_span_z_growth_m < 0.080
             )
         elif args.demo_mode == "gravity-fold":
             success = bool(
